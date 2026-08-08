@@ -4,5 +4,4 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait", "tokio"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait"] }
