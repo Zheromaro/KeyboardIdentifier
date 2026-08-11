@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait"] }
+udev = "0.9.3"

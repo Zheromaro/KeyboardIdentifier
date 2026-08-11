@@ -1,9 +1,7 @@
 #![allow(dead_code)]
-use crate::components::{DeviceSource, InputDevice, InputEvent};
+use crate::interface::{DeviceSource, InputDevice, InputEvent};
 use std::{
-    cell::RefCell,
-    collections::HashMap,
-    path::PathBuf,
+    cell::{Cell, RefCell},
     sync::{Arc, Mutex},
 };
 
@@ -30,12 +28,8 @@ pub struct MockDevice {
 impl InputDevice for MockDevice {
     type Event = MockEvent;
 
-    fn is_keyboard(&self) -> bool {
-        self.keyboard
-    }
-
-    fn name(&self) -> Option<String> {
-        Some(self.name.clone())
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
     }
 
     fn fetch_events(&mut self) -> Result<Vec<MockEvent>, std::io::Error> {
@@ -53,59 +47,56 @@ impl InputDevice for MockDevice {
 
 // ==== MockDeviceSource ====
 pub struct MockDeviceSource {
-    devices: RefCell<HashMap<PathBuf, MockDevice>>,
+    devices: RefCell<Vec<MockDevice>>,
+    next_id: Cell<usize>,
 }
 
 impl MockDeviceSource {
     pub fn new() -> Self {
         Self {
-            devices: RefCell::new(HashMap::new()),
+            devices: RefCell::new(Vec::new()),
+            next_id: Cell::new(0),
         }
     }
 
-    pub fn plug_keyboard(&self) -> PathBuf {
-        let index = self.devices.borrow().len();
-        let path = PathBuf::from(format!("/dev/input/mock{}", index));
+    pub fn plug_keyboard(&self) -> MockDevice {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+
         let dev = MockDevice {
-            name: format!("Mock Keyboard {}", index),
+            name: format!("Mock Keyboard {}", id),
             keyboard: true,
             buffer: Arc::new(Mutex::new(vec![])),
         };
-        self.devices.borrow_mut().insert(path.clone(), dev);
-        path
+        self.devices.borrow_mut().push(dev.clone());
+        dev
     }
 
-    pub fn unplug_keyboard(&self) {
-        let path = { self.devices.borrow().keys().last().cloned() };
+    pub fn unplug_keyboard(&self, device: &MockDevice) {
+        let mut devices = self.devices.borrow_mut();
 
-        if let Some(path) = path {
-            self.devices.borrow_mut().remove(&path);
+        if let Some(index) = devices.iter().position(|dev| device.equal(dev)) {
+            devices.remove(index);
         }
     }
 
-    pub fn press(&self, path: &PathBuf) {
-        if let Some(dev) = self.devices.borrow().get(path) {
-            dev.buffer.lock().unwrap().push(MockEvent { is_key: true });
-        }
+    pub fn press(&self, device: &MockDevice) {
+        device
+            .buffer
+            .lock()
+            .unwrap()
+            .push(MockEvent { is_key: true });
     }
 }
 
 impl DeviceSource for MockDeviceSource {
     type Device = MockDevice;
 
-    fn enumerate(&self) -> Vec<(PathBuf, MockDevice)> {
+    fn get_keyboards(&self) -> Vec<Self::Device> {
         self.devices
             .borrow()
             .iter()
-            .map(|(p, d)| (p.clone(), d.clone()))
+            .map(|dev| dev.clone())
             .collect()
-    }
-
-    fn open(&self, path: &PathBuf) -> Result<MockDevice, std::io::Error> {
-        self.devices
-            .borrow()
-            .get(path)
-            .cloned()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such device"))
     }
 }
