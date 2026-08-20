@@ -1,11 +1,11 @@
 mod common;
 use common::*;
-use keyboard_identifier::*;
+use keyboard_identifier::keyboard_provider::DeviceProvider;
 
 #[test]
 fn test_no_keyboard() {
     let computer = MockDeviceSource::new();
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.is_empty());
 }
 
@@ -13,11 +13,11 @@ fn test_no_keyboard() {
 fn test_plugging_keyboard() {
     let computer = MockDeviceSource::new();
 
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_none());
 
     computer.plug_keyboard();
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_some());
 }
 
@@ -26,12 +26,12 @@ fn test_unplugging_keyboard() {
     let computer = MockDeviceSource::new();
     let keyboard = computer.plug_keyboard();
 
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_some());
 
     computer.unplug_keyboard(&keyboard);
 
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_none());
 }
 
@@ -39,15 +39,15 @@ fn test_unplugging_keyboard() {
 fn test_plugging_unplugging_keyboard() {
     let computer = MockDeviceSource::new();
 
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_none());
 
     let keyboard = computer.plug_keyboard();
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_some());
 
     computer.unplug_keyboard(&keyboard);
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_none());
 }
 
@@ -56,7 +56,7 @@ fn test_one_keyboard() {
     let computer = MockDeviceSource::new();
     computer.plug_keyboard();
 
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     assert!(keyboard_list.get(0).is_some());
     assert!(keyboard_list.get(1).is_none());
 }
@@ -68,7 +68,7 @@ fn test_multiple_keyboards() {
         computer.plug_keyboard();
     }
 
-    let keyboard_list = get_keyboard_list(&computer);
+    let keyboard_list = computer.get_keyboards();
     (0..5).for_each(|i| assert!(keyboard_list.get(i).is_some()));
     assert!(keyboard_list.get(5).is_none());
 }

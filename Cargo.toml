@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
 udev = "0.9.3"

@@ -1,75 +1,147 @@
-use crate::interface::*;
+use crate::keyboard_provider::*;
+use crate::registry::*;
 use std::sync::Arc;
-use std::{io, thread, time::Duration};
+use std::time::Duration;
+use tokio::sync::broadcast;
 
-type Job = Arc<dyn Fn() + Send + Sync + 'static>;
+pub type Callback = Arc<dyn Fn() + Send + Sync + 'static>;
 
-pub struct KeyboardListener<D: InputDevice + Send + 'static> {
-    device: D,
-    on_pressed: Vec<Job>,
-    on_plugged: Vec<Job>,
-    on_unplugged: Vec<Job>,
+pub struct KeyboardListener {
+    on_pressed: Registry<Callback>,
+    on_plugged: Registry<Callback>,
+    on_unplugged: Registry<Callback>,
+    keyboards: Registry<KeyboardID>,
+    ports: Registry<Port>,
+    shutdown: broadcast::Sender<()>,
 }
 
-impl<D: InputDevice + Send + 'static> KeyboardListener<D> {
-    pub fn new(device: D) -> Self {
+impl Default for KeyboardListener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyboardListener {
+    pub fn new() -> Self {
+        let (shutdown, _) = broadcast::channel(1);
         Self {
-            device,
-            on_pressed: Vec::new(),
-            on_plugged: Vec::new(),
-            on_unplugged: Vec::new(),
+            on_pressed: Registry::new(),
+            on_plugged: Registry::new(),
+            on_unplugged: Registry::new(),
+            keyboards: Registry::new(),
+            ports: Registry::new(),
+            shutdown,
         }
     }
 
-    pub fn on_pressed<F: Fn() + Send + Sync + 'static>(&mut self, job: F) {
-        self.on_pressed.push(Arc::new(job));
-    }
-
-    pub fn on_plugged<F: Fn() + Send + Sync + 'static>(&mut self, job: F) {
-        self.on_plugged.push(Arc::new(job));
-    }
-
-    pub fn on_unplugged<F: Fn() + Send + Sync + 'static>(&mut self, job: F) {
-        self.on_unplugged.push(Arc::new(job));
-    }
-
-    // TODO: pub fn drop_listener() {}
-
-    pub fn start_listener(mut self) {
-        // TODO: self.device.open();
-
-        for job in &self.on_plugged {
-            job();
+    pub fn listen_to_keyboard<D: KeyboardDevice + Send + 'static>(&self, mut keyboard: D) {
+        if !keyboard.is_plugged() {
+            eprintln!(
+                "keyboard Identifier Warning: listen_to_keyboard() called with unplugged keyboard: {}",
+                keyboard.id().as_str()
+            );
+            return;
         }
 
-        thread::spawn(move || {
+        let keyboard_id = keyboard.id();
+        let keyboards = self.keyboards.clone();
+        let id = match keyboards.register_unique(keyboard.id().as_str(), keyboard_id) {
+            Some(id) => id,
+            None => {
+                eprintln!(
+                    "keyboard Identifier Warning: listen_to_keyboard() already called with keyboard: {}",
+                    keyboard.id().as_str()
+                );
+                return;
+            }
+        };
+
+        let on_pressed = self.on_pressed.clone();
+        let mut shutdown = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
             loop {
-                match self.device.fetch_events() {
-                    Ok(events) => {
-                        for event in events {
-                            if event.is_key_event() {
-                                for job in &self.on_pressed {
-                                    job();
-                                }
-                            }
-                        }
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        keyboards.unregister(id);
+                        break;
                     }
-                    Err(e) => {
-                        let is_unplugged = matches!(e.raw_os_error(), Some(19) | Some(5))
-                            || e.kind() == io::ErrorKind::NotFound;
-
-                        if is_unplugged {
-                            for job in &self.on_unplugged {
-                                job();
+                    result = keyboard.fetch_events() => {
+                        match result {
+                            Ok(()) => {
+                                on_pressed.for_each(|cb| (&**cb)());
                             }
-                            break;
-                        } else {
-                            eprintln!("Read error: {} (raw: {:?})", e, e.raw_os_error());
-                            thread::sleep(Duration::from_millis(100));
+                            Err(e) => {
+                                eprintln!("keyboard Identifier Error: {e}");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
                         }
                     }
                 }
             }
         });
+    }
+
+    pub fn listen_to_port<P: DeviceProvider + Send + 'static>(&self, port: Port, mut provider: P) {
+        let ports = self.ports.clone();
+        let id = match ports
+            .register_unique(port.physical_path.as_ref().unwrap().clone(), port.clone())
+        {
+            Some(id) => id,
+            None => {
+                eprintln!(
+                    "keyboard Identifier Warning: listen_to_port() already called with port: {}",
+                    &port.physical_path.unwrap()
+                );
+                return;
+            }
+        };
+
+        let on_plugged = self.on_plugged.clone();
+        let mut shutdown = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.recv() => {
+                        ports.unregister(id);
+                        break;
+                    }
+                    result = provider.plugged_event() => {
+                        match result {
+                            Ok((_keyboard_id, plugged_port)) => {
+                                if plugged_port == port {
+                                    on_plugged.for_each(|cb| (&**cb)());
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("keyboard Identifier Error: {e}");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn on_plugged<F: Fn() + Send + Sync + 'static>(&self, callback: F) {
+        self.on_plugged.register(Arc::new(callback));
+    }
+
+    pub fn on_unplugged<F: Fn() + Send + Sync + 'static>(&self, callback: F) {
+        self.on_unplugged.register(Arc::new(callback));
+    }
+
+    pub fn on_pressed<F: Fn() + Send + Sync + 'static>(&self, callback: F) {
+        self.on_pressed.register(Arc::new(callback));
+    }
+}
+
+impl Drop for KeyboardListener {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
     }
 }

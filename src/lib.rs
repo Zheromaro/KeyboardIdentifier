@@ -1,6 +1,5 @@
-pub mod interface;
-mod keyboard_identifier;
 mod keyboard_listener;
+pub mod keyboard_provider;
 mod platforms;
-pub use keyboard_identifier::*;
+mod registry;
 pub use keyboard_listener::*;

@@ -1,102 +1,125 @@
 #![allow(dead_code)]
-use crate::interface::{DeviceSource, InputDevice, InputEvent};
-use std::{
-    cell::{Cell, RefCell},
-    sync::{Arc, Mutex},
+use keyboard_identifier::keyboard_provider::{DeviceProvider, KeyboardDevice, KeyboardID, Port};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-// ==== MockEvent ====
-#[derive(Clone)]
-pub struct MockEvent {
-    pub is_key: bool,
-}
-
-impl InputEvent for MockEvent {
-    fn is_key_event(&self) -> bool {
-        self.is_key
-    }
-}
-
-// ==== MockDevice ====
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MockDevice {
-    pub name: String,
-    pub keyboard: bool,
-    pub buffer: Arc<Mutex<Vec<MockEvent>>>,
+    pub id: KeyboardID,
+    pub port: Port,
+    pub pressed: Arc<AtomicUsize>,
 }
 
-impl InputDevice for MockDevice {
-    type Event = MockEvent;
-
-    fn equal(&self, other: &Self) -> bool {
-        self.name == other.name
+impl KeyboardDevice for MockDevice {
+    fn id(&self) -> KeyboardID {
+        self.id.clone()
     }
 
-    fn fetch_events(&mut self) -> Result<Vec<MockEvent>, std::io::Error> {
-        let mut buf = self.buffer.lock().unwrap();
-        if buf.is_empty() {
-            // Release lock before sleeping so press() can write
-            drop(buf);
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            Ok(vec![])
-        } else {
-            Ok(std::mem::take(&mut *buf))
+    fn port(&self) -> Port {
+        self.port.clone()
+    }
+
+    async fn fetch_events(&mut self) -> Result<(), std::io::Error> {
+        loop {
+            if self.pressed.load(Ordering::SeqCst) > 0 {
+                self.pressed.fetch_sub(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 }
 
-// ==== MockDeviceSource ====
 pub struct MockDeviceSource {
-    devices: RefCell<Vec<MockDevice>>,
-    next_id: Cell<usize>,
+    devices: Mutex<Vec<MockDevice>>,
+    next_id: AtomicUsize,
+    tx: UnboundedSender<(KeyboardID, Port)>,
+    rx: UnboundedReceiver<(KeyboardID, Port)>,
 }
 
 impl MockDeviceSource {
     pub fn new() -> Self {
+        let (tx, rx) = unbounded_channel();
         Self {
-            devices: RefCell::new(Vec::new()),
-            next_id: Cell::new(0),
+            devices: Mutex::new(Vec::new()),
+            next_id: AtomicUsize::new(0),
+            tx,
+            rx,
         }
     }
 
     pub fn plug_keyboard(&self) -> MockDevice {
-        let id = self.next_id.get();
-        self.next_id.set(id + 1);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        let dev = MockDevice {
-            name: format!("Mock Keyboard {}", id),
-            keyboard: true,
-            buffer: Arc::new(Mutex::new(vec![])),
+        let device = MockDevice {
+            id: KeyboardID {
+                name: Some(format!("Mock Keyboard {id}")),
+                vendor_id: Some("MOCK".into()),
+                product_id: Some(format!("{id:04}")),
+                serial: Some(format!("MOCK-SERIAL-{id}")),
+            },
+            port: Port {
+                physical_path: Some(format!("/mock/keyboard/{id}")),
+            },
+            pressed: Arc::new(AtomicUsize::new(0)),
         };
-        self.devices.borrow_mut().push(dev.clone());
-        dev
+
+        // Store the device and notify the plugged listener
+        self.devices.lock().unwrap().push(device.clone());
+        let _ = self.tx.send((device.id.clone(), device.port.clone()));
+
+        device
     }
 
     pub fn unplug_keyboard(&self, device: &MockDevice) {
-        let mut devices = self.devices.borrow_mut();
-
-        if let Some(index) = devices.iter().position(|dev| device.equal(dev)) {
-            devices.remove(index);
-        }
+        self.devices
+            .lock()
+            .unwrap()
+            .retain(|dev| dev.id != device.id);
     }
 
     pub fn press(&self, device: &MockDevice) {
-        device
-            .buffer
+        if let Some(dev) = self
+            .devices
             .lock()
             .unwrap()
-            .push(MockEvent { is_key: true });
+            .iter_mut()
+            .find(|dev| dev.id == device.id)
+        {
+            dev.pressed.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
-impl DeviceSource for MockDeviceSource {
+impl Default for MockDeviceSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeviceProvider for MockDeviceSource {
     type Device = MockDevice;
 
     fn get_keyboards(&self) -> Vec<Self::Device> {
+        self.devices.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn get_ports(&self) -> Vec<Port> {
         self.devices
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
-            .map(|dev| dev.clone())
+            .map(|dev| dev.port.clone())
             .collect()
+    }
+
+    async fn plugged(&mut self) -> Result<(KeyboardID, Port), std::io::Error> {
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "channel closed"))
     }
 }
