@@ -11,7 +11,7 @@ pub struct KeyboardListener {
     on_plugged: Registry<Callback>,
     on_unplugged: Registry<Callback>,
     keyboards: Registry<KeyboardID>,
-    ports: Registry<Port>,
+    ports: Registry<PortID>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -34,17 +34,10 @@ impl KeyboardListener {
         }
     }
 
-    pub fn listen_to_keyboard<D: KeyboardDevice + Send + 'static>(&self, mut keyboard: D) {
-        if !keyboard.is_plugged() {
-            eprintln!(
-                "keyboard Identifier Warning: listen_to_keyboard() called with unplugged keyboard: {}",
-                keyboard.id().as_str()
-            );
-            return;
-        }
-
+    pub fn listen_to_keyboard<D: Keyboard + Send + 'static>(&self, mut keyboard: D) {
         let keyboard_id = keyboard.id();
         let keyboards = self.keyboards.clone();
+
         let id = match keyboards.register_unique(keyboard.id().as_str(), keyboard_id) {
             Some(id) => id,
             None => {
@@ -57,6 +50,8 @@ impl KeyboardListener {
         };
 
         let on_pressed = self.on_pressed.clone();
+        let on_plugged = self.on_plugged.clone();
+        let on_unplugged = self.on_unplugged.clone();
         let mut shutdown = self.shutdown.subscribe();
 
         tokio::spawn(async move {
@@ -67,14 +62,29 @@ impl KeyboardListener {
                         keyboards.unregister(id);
                         break;
                     }
-                    result = keyboard.fetch_events() => {
+                    result = keyboard.next_event() => {
                         match result {
-                            Ok(()) => {
+                            Ok(ProviderEvent::Plugged{ keyboard_id, port }) => {
+                                on_plugged.for_each(|cb| (&**cb)());
+                            }
+
+                            Ok(ProviderEvent::Unplugged{ keyboard_id, port }) => {
+                                on_unplugged.for_each(|cb| (&**cb)());
+
+                                keyboards.unregister(id);
+                                break;
+                            }
+
+                            Ok(ProviderEvent::Pressed{ keyboard_id, port }) => {
                                 on_pressed.for_each(|cb| (&**cb)());
                             }
+
                             Err(e) => {
                                 eprintln!("keyboard Identifier Error: {e}");
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                                tokio::time::sleep(
+                                    Duration::from_millis(100)
+                                ).await;
                             }
                         }
                     }
@@ -83,22 +93,24 @@ impl KeyboardListener {
         });
     }
 
-    pub fn listen_to_port<P: DeviceProvider + Send + 'static>(&self, port: Port, mut provider: P) {
+    pub fn listen_to_port<P: Port + Send + 'static>(&self, mut port: P) {
+        let port_id = port.id();
         let ports = self.ports.clone();
-        let id = match ports
-            .register_unique(port.physical_path.as_ref().unwrap().clone(), port.clone())
-        {
+
+        let id = match ports.register_unique(port.id().as_str(), port_id) {
             Some(id) => id,
             None => {
                 eprintln!(
-                    "keyboard Identifier Warning: listen_to_port() already called with port: {}",
-                    &port.physical_path.unwrap()
+                    "keyboard Identifier Warning: listen_to_keyboard() already called with keyboard: {}",
+                    port.id().as_str()
                 );
                 return;
             }
         };
 
+        let on_pressed = self.on_pressed.clone();
         let on_plugged = self.on_plugged.clone();
+        let on_unplugged = self.on_unplugged.clone();
         let mut shutdown = self.shutdown.subscribe();
 
         tokio::spawn(async move {
@@ -109,16 +121,25 @@ impl KeyboardListener {
                         ports.unregister(id);
                         break;
                     }
-                    result = provider.plugged_event() => {
+                    result = port.next_event() => {
                         match result {
-                            Ok((_keyboard_id, plugged_port)) => {
-                                if plugged_port == port {
-                                    on_plugged.for_each(|cb| (&**cb)());
-                                }
+                            Ok(ProviderEvent::Plugged{ keyboard_id, port }) => {
+                                on_plugged.for_each(|cb| (&**cb)());
+                            }
+                            Ok(ProviderEvent::Unplugged{ keyboard_id, port }) => {
+                                on_unplugged.for_each(|cb| (&**cb)());
+                                ports.unregister(id);
+                                break;
+                            }
+                            Ok(ProviderEvent::Pressed{ keyboard_id, port }) => {
+                                on_pressed.for_each(|cb| (&**cb)());
                             }
                             Err(e) => {
                                 eprintln!("keyboard Identifier Error: {e}");
-                                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                                tokio::time::sleep(
+                                    Duration::from_millis(100)
+                                ).await;
                             }
                         }
                     }

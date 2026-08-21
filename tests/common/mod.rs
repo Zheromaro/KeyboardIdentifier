@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use keyboard_identifier::keyboard_provider::{DeviceProvider, KeyboardDevice, KeyboardID, Port};
+use keyboard_identifier::keyboard_provider::{DeviceProvider, Keyboard, KeyboardID, PortID};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -9,16 +9,16 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 #[derive(Clone, Debug)]
 pub struct MockDevice {
     pub id: KeyboardID,
-    pub port: Port,
+    pub port: PortID,
     pub pressed: Arc<AtomicUsize>,
 }
 
-impl KeyboardDevice for MockDevice {
+impl Keyboard for MockDevice {
     fn id(&self) -> KeyboardID {
         self.id.clone()
     }
 
-    fn port(&self) -> Port {
+    fn port(&self) -> PortID {
         self.port.clone()
     }
 
@@ -36,8 +36,8 @@ impl KeyboardDevice for MockDevice {
 pub struct MockDeviceSource {
     devices: Mutex<Vec<MockDevice>>,
     next_id: AtomicUsize,
-    tx: UnboundedSender<(KeyboardID, Port)>,
-    rx: UnboundedReceiver<(KeyboardID, Port)>,
+    tx: UnboundedSender<(KeyboardID, PortID)>,
+    rx: UnboundedReceiver<(KeyboardID, PortID)>,
 }
 
 impl MockDeviceSource {
@@ -61,7 +61,7 @@ impl MockDeviceSource {
                 product_id: Some(format!("{id:04}")),
                 serial: Some(format!("MOCK-SERIAL-{id}")),
             },
-            port: Port {
+            port: PortID {
                 physical_path: Some(format!("/mock/keyboard/{id}")),
             },
             pressed: Arc::new(AtomicUsize::new(0)),
@@ -107,7 +107,7 @@ impl DeviceProvider for MockDeviceSource {
         self.devices.lock().unwrap().iter().cloned().collect()
     }
 
-    fn get_ports(&self) -> Vec<Port> {
+    fn get_ports(&self) -> Vec<PortID> {
         self.devices
             .lock()
             .unwrap()
@@ -116,7 +116,7 @@ impl DeviceProvider for MockDeviceSource {
             .collect()
     }
 
-    async fn plugged(&mut self) -> Result<(KeyboardID, Port), std::io::Error> {
+    async fn plugged(&mut self) -> Result<(KeyboardID, PortID), std::io::Error> {
         self.rx
             .recv()
             .await
