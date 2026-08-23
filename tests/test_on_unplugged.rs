@@ -1,1 +1,133 @@
+mod common;
 
+use common::*;
+use keyboard_identifier::*;
+use std::time::Duration;
+use tokio::time::timeout;
+
+// --- Helper Functions ---
+
+async fn expect_recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
+    timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .expect("Timed out waiting for event")
+        .expect("Channel closed unexpectedly")
+}
+
+async fn expect_timeout<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) {
+    let result = timeout(Duration::from_millis(100), rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "Expected timeout, but received an unexpected event"
+    );
+}
+
+// --- Tests ---
+
+#[tokio::test]
+async fn test_no_unplug() {
+    let computer = MockDeviceSource::new();
+    let _keyboard = computer.plug_keyboard();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    listener.on_unplugged(move |_| {
+        let _ = tx.send(());
+    });
+    listener.listen(computer);
+    tokio::task::yield_now().await;
+
+    // Keyboard was plugged in, but never unplugged
+    expect_timeout(&mut rx).await;
+}
+
+#[tokio::test]
+async fn test_one_unplug_one_job() {
+    let computer = MockDeviceSource::new();
+    let keyboard = computer.plug_keyboard();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    listener.on_unplugged(move |_| {
+        let _ = tx.send(());
+    });
+    listener.listen(computer.clone());
+    tokio::task::yield_now().await;
+
+    computer.unplug_keyboard(&keyboard);
+
+    expect_recv(&mut rx).await;
+    expect_timeout(&mut rx).await;
+}
+
+#[tokio::test]
+async fn test_two_unplugs_one_job() {
+    let computer = MockDeviceSource::new();
+    let kb1 = computer.plug_keyboard();
+    let kb2 = computer.plug_keyboard();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    listener.on_unplugged(move |_| {
+        let _ = tx.send(());
+    });
+    listener.listen(computer.clone());
+    tokio::task::yield_now().await;
+
+    computer.unplug_keyboard(&kb1);
+    computer.unplug_keyboard(&kb2);
+
+    expect_recv(&mut rx).await;
+    expect_recv(&mut rx).await;
+    expect_timeout(&mut rx).await;
+}
+
+#[tokio::test]
+async fn test_one_unplug_two_jobs() {
+    let computer = MockDeviceSource::new();
+    let keyboard = computer.plug_keyboard();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let tx1 = tx.clone();
+    listener.on_unplugged(move |_| {
+        let _ = tx1.send("job1");
+    });
+
+    let tx2 = tx.clone();
+    listener.on_unplugged(move |_| {
+        let _ = tx2.send("job2");
+    });
+
+    listener.listen(computer.clone());
+    tokio::task::yield_now().await;
+
+    computer.unplug_keyboard(&keyboard);
+
+    let mut results = vec![expect_recv(&mut rx).await, expect_recv(&mut rx).await];
+    results.sort();
+
+    assert_eq!(results, vec!["job1", "job2"]);
+    expect_timeout(&mut rx).await;
+}
+
+#[tokio::test]
+async fn test_unplugged_id_verification() {
+    let computer = MockDeviceSource::new();
+    let keyboard = computer.plug_keyboard();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    listener.on_unplugged(move |kb| {
+        let _ = tx.send(kb.keyboard_id.clone());
+    });
+
+    listener.listen(computer.clone());
+    tokio::task::yield_now().await;
+
+    computer.unplug_keyboard(&keyboard);
+
+    let received_id = expect_recv(&mut rx).await;
+    assert_eq!(received_id, keyboard.keyboard_id);
+    expect_timeout(&mut rx).await;
+}

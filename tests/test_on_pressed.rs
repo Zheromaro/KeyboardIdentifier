@@ -2,35 +2,43 @@ mod common;
 
 use common::*;
 use keyboard_identifier::*;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 use tokio::time::timeout;
+
+// --- Helper Functions for Cleaner Tests ---
+
+/// Waits for a message on the channel, failing if it times out.
+async fn expect_recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
+    timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .expect("Timed out waiting for event")
+        .expect("Channel closed unexpectedly")
+}
+
+/// Ensures no messages are received within the timeout window.
+async fn expect_timeout<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) {
+    let result = timeout(Duration::from_millis(100), rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "Expected timeout, but received an unexpected event"
+    );
+}
+
+// --- Tests ---
 
 #[tokio::test]
 async fn test_no_press() {
     let computer = MockDeviceSource::new();
-    let keyboard = computer.plug_keyboard();
-    let mut listener = KeyboardListener::new();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let called = Arc::new(AtomicU8::new(0));
-    let called_flag = Arc::clone(&called);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-
-    listener.on_pressed(move || {
-        called_flag.fetch_add(1, Ordering::SeqCst);
-        let _ = tx.blocking_send(());
+    listener.on_pressed(move |_| {
+        let _ = tx.send(());
     });
-    listener.listen_to_keyboard(keyboard);
+    listener.listen(computer);
     tokio::task::yield_now().await;
 
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_err());
-    assert_eq!(called.load(Ordering::SeqCst), 0);
+    expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
@@ -38,133 +46,125 @@ async fn test_other_keyboard_press_one_job() {
     let computer = MockDeviceSource::new();
     let keyboard = computer.plug_keyboard();
     let keyboard2 = computer.plug_keyboard();
-    let mut listener = KeyboardListener::new();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let called = Arc::new(AtomicU8::new(0));
-    let called_flag = Arc::clone(&called);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    // FIX: Clone the ID before moving it into the closure
+    let target_id = keyboard.keyboard_id.clone();
 
-    listener.on_pressed(move || {
-        called_flag.fetch_add(1, Ordering::SeqCst);
-        let _ = tx.blocking_send(());
+    listener.on_pressed(move |kb| {
+        if kb.keyboard_id == target_id {
+            let _ = tx.send(());
+        }
     });
-    listener.listen_to_keyboard(keyboard.clone());
+
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
     computer.press(&keyboard2);
 
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_err());
-    assert_eq!(called.load(Ordering::SeqCst), 0);
+    expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
 async fn test_one_press_one_job() {
     let computer = MockDeviceSource::new();
     let keyboard = computer.plug_keyboard();
-    let mut listener = KeyboardListener::new();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let called = Arc::new(AtomicU8::new(0));
-    let called_flag = Arc::clone(&called);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-
-    listener.on_pressed(move || {
-        called_flag.fetch_add(1, Ordering::SeqCst);
-        let _ = tx.blocking_send(());
+    listener.on_pressed(move |_| {
+        let _ = tx.send(());
     });
-    listener.listen_to_keyboard(keyboard.clone());
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
     computer.press(&keyboard);
 
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_ok());
-    assert_eq!(called.load(Ordering::SeqCst), 1);
+    expect_recv(&mut rx).await;
+    expect_timeout(&mut rx).await; // Verify no extra presses occurred
 }
 
 #[tokio::test]
 async fn test_two_presses_one_job() {
     let computer = MockDeviceSource::new();
     let keyboard = computer.plug_keyboard();
-    let mut listener = KeyboardListener::new();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let called = Arc::new(AtomicU8::new(0));
-    let called_flag = Arc::clone(&called);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-
-    listener.on_pressed(move || {
-        called_flag.fetch_add(1, Ordering::SeqCst);
-        let _ = tx.blocking_send(());
+    listener.on_pressed(move |_| {
+        let _ = tx.send(());
     });
-    listener.listen_to_keyboard(keyboard.clone());
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
+
     computer.press(&keyboard);
     computer.press(&keyboard);
 
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_ok());
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_ok());
-    assert_eq!(called.load(Ordering::SeqCst), 2);
+    expect_recv(&mut rx).await;
+    expect_recv(&mut rx).await;
+    expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
 async fn test_one_press_two_jobs() {
     let computer = MockDeviceSource::new();
     let keyboard = computer.plug_keyboard();
-    let mut listener = KeyboardListener::new();
+    let listener = KeyboardListener::new();
 
-    let called = Arc::new(AtomicU8::new(0));
-    let called_flag1 = Arc::clone(&called);
-    let called_flag2 = Arc::clone(&called);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let target_id = keyboard.keyboard_id.clone();
+    let tx1 = tx.clone();
+    listener.on_pressed(move |kb| {
+        if kb.keyboard_id == target_id {
+            let _ = tx1.send("job1");
+        }
+    });
+
     let tx2 = tx.clone();
+    listener.on_pressed(move |_| {
+        let _ = tx2.send("job2");
+    });
 
-    listener.on_pressed(move || {
-        called_flag1.fetch_add(2, Ordering::SeqCst);
-        let _ = tx.blocking_send(());
-    });
-    listener.on_pressed(move || {
-        called_flag2.fetch_sub(1, Ordering::SeqCst);
-        let _ = tx2.blocking_send(());
-    });
-    listener.listen_to_keyboard(keyboard.clone());
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
     computer.press(&keyboard);
 
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_ok());
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(result.is_ok());
-    assert_eq!(called.load(Ordering::SeqCst), 1);
+    let mut results = vec![expect_recv(&mut rx).await, expect_recv(&mut rx).await];
+    results.sort(); // Sort because concurrent job execution order isn't guaranteed
+
+    assert_eq!(results, vec!["job1", "job2"]);
+    expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
 async fn test_two_presses_two_jobs() {
     let computer = MockDeviceSource::new();
     let keyboard = computer.plug_keyboard();
-    let mut listener = KeyboardListener::new();
+    let listener = KeyboardListener::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let called = Arc::new(AtomicU8::new(0));
-    let called_flag1 = Arc::clone(&called);
-    let called_flag2 = Arc::clone(&called);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let tx1 = tx.clone();
+    listener.on_pressed(move |_| {
+        let _ = tx1.send("job1");
+    });
+
     let tx2 = tx.clone();
+    listener.on_pressed(move |_| {
+        let _ = tx2.send("job2");
+    });
 
-    listener.on_pressed(move || {
-        called_flag1.fetch_add(2, Ordering::SeqCst);
-        let _ = tx.blocking_send(());
-    });
-    listener.on_pressed(move || {
-        called_flag2.fetch_sub(1, Ordering::SeqCst);
-        let _ = tx2.blocking_send(());
-    });
-    listener.listen_to_keyboard(keyboard.clone());
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
+
     computer.press(&keyboard);
     computer.press(&keyboard);
 
+    let mut results = Vec::new();
     for _ in 0..4 {
-        let result = timeout(Duration::from_millis(100), rx.recv()).await;
-        assert!(result.is_ok());
+        results.push(expect_recv(&mut rx).await);
     }
-    assert_eq!(called.load(Ordering::SeqCst), 2);
+
+    assert_eq!(results.iter().filter(|&&s| s == "job1").count(), 2);
+    assert_eq!(results.iter().filter(|&&s| s == "job2").count(), 2);
+    expect_timeout(&mut rx).await;
 }
