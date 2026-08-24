@@ -4,6 +4,11 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait"] }
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait",] }
 udev = "0.9.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse",] }

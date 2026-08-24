@@ -2,27 +2,6 @@ mod common;
 
 use common::*;
 use keyboard_identifier::*;
-use std::time::Duration;
-use tokio::time::timeout;
-
-// --- Helper Functions ---
-
-async fn expect_recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
-    timeout(Duration::from_millis(100), rx.recv())
-        .await
-        .expect("Timed out waiting for event")
-        .expect("Channel closed unexpectedly")
-}
-
-async fn expect_timeout<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) {
-    let result = timeout(Duration::from_millis(100), rx.recv()).await;
-    assert!(
-        result.is_err(),
-        "Expected timeout, but received an unexpected event"
-    );
-}
-
-// --- Tests ---
 
 #[tokio::test]
 async fn test_listen_routes_all_events() {

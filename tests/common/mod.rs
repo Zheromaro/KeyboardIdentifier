@@ -7,8 +7,10 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::time::timeout;
 
 #[derive(Clone)]
 pub struct MockDeviceSource {
@@ -85,4 +87,20 @@ impl DeviceProvider for MockDeviceSource {
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "channel closed"))
         }
     }
+}
+
+// healpers
+pub async fn expect_recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
+    timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .expect("Timed out waiting for event")
+        .expect("Channel closed unexpectedly")
+}
+
+pub async fn expect_timeout<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) {
+    let result = timeout(Duration::from_millis(100), rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "Expected timeout, but received an unexpected event"
+    );
 }
