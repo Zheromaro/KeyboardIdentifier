@@ -31,14 +31,6 @@ impl<T> Registry<T> {
         id
     }
 
-    pub fn unregister(&self, id: u64) -> Option<T> {
-        let mut state = self.inner.lock().unwrap();
-
-        let removed_item = state.items.remove(&id);
-
-        removed_item
-    }
-
     pub fn for_each<F>(&self, mut f: F)
     where
         T: Clone,

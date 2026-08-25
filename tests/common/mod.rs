@@ -22,16 +22,6 @@ pub struct MockDeviceSource {
 }
 
 impl MockDeviceSource {
-    pub fn new() -> Self {
-        let (tx, rx) = unbounded_channel();
-        Self {
-            devices: Arc::new(Mutex::new(Vec::new())),
-            next_id: Arc::new(AtomicUsize::new(0)),
-            tx,
-            rx: Arc::new(AsyncMutex::new(rx)),
-        }
-    }
-
     pub fn plug_keyboard(&self) -> Keyboard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -66,30 +56,32 @@ impl MockDeviceSource {
     }
 }
 
-impl Default for MockDeviceSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DeviceProvider for MockDeviceSource {
+    async fn new() -> Self {
+        let (tx, rx) = unbounded_channel();
+        Self {
+            devices: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(AtomicUsize::new(0)),
+            tx,
+            rx: Arc::new(AsyncMutex::new(rx)),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<ProviderEvent, std::io::Error> {
+        self.rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "channel closed"))
+    }
+
     fn get_keyboards(&self) -> Vec<Keyboard> {
         self.devices.lock().unwrap().clone()
     }
-
-    fn next_event(&self) -> impl Future<Output = Result<ProviderEvent, std::io::Error>> + Send {
-        async {
-            self.rx
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "channel closed"))
-        }
-    }
 }
 
-// healpers
+// ==== healpers ====
 pub async fn expect_recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
     timeout(Duration::from_millis(100), rx.recv())
         .await

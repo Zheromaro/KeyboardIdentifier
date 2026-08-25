@@ -5,9 +5,11 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait",] }
+evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait", "tokio"] }
 udev = "0.9.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]

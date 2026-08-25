@@ -23,7 +23,7 @@ impl Keyboard {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
     Plugged(Keyboard),
     Unplugged(Keyboard),
@@ -31,6 +31,7 @@ pub enum ProviderEvent {
 }
 
 pub trait DeviceProvider {
+    async fn new() -> Self;
+    fn next_event(&mut self) -> impl Future<Output = Result<ProviderEvent, std::io::Error>> + Send;
     fn get_keyboards(&self) -> Vec<Keyboard>;
-    fn next_event(&self) -> impl Future<Output = Result<ProviderEvent, std::io::Error>> + Send;
 }

@@ -42,7 +42,7 @@ impl KeyboardListener {
         self.on_pressed.register(Arc::new(callback));
     }
 
-    pub fn listen<D: DeviceProvider + Send + 'static>(&self, provider: D) {
+    pub fn listen<D: DeviceProvider + Send + 'static>(&self, mut provider: D) {
         let on_pressed = self.on_pressed.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();
