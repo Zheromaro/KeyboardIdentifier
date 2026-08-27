@@ -1,0 +1,7 @@
+Shop owner gets a usb numpad
+plugs numpad
+goes to kompleta
+goes to config
+goes to keyboards tab
+clicks on SET AUXILIARY NUMPAD
+window pops up : please press a button on the auxiliary numpad

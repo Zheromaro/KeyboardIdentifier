@@ -1,4 +1,5 @@
 use crate::keyboard_provider::*;
+use crate::platforms::*;
 use crate::registry::*;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -10,12 +11,6 @@ pub struct KeyboardListener {
     on_plugged: Registry<Callback>,
     on_unplugged: Registry<Callback>,
     shutdown: broadcast::Sender<()>,
-}
-
-impl Default for KeyboardListener {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl KeyboardListener {
@@ -42,7 +37,12 @@ impl KeyboardListener {
         self.on_pressed.register(Arc::new(callback));
     }
 
-    pub fn listen<D: DeviceProvider + Send + 'static>(&self, mut provider: D) {
+    pub async fn listen(&self) {
+        let provider = NativeDeviceProvider::new().await;
+        self.listen_with(provider).await;
+    }
+
+    pub async fn listen_with<D: DeviceProvider + Send + 'static>(&self, mut provider: D) {
         let on_pressed = self.on_pressed.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();

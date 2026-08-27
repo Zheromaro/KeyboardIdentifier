@@ -2,16 +2,16 @@ mod common;
 use common::*;
 use keyboard_identifier::keyboard_provider::DeviceProvider;
 
-#[test]
-fn test_no_keyboards() {
-    let computer = MockDeviceSource::new();
+#[tokio::test]
+async fn test_no_keyboards() {
+    let computer = MockDeviceSource::new().await;
 
     assert!(computer.get_keyboards().is_empty());
 }
 
-#[test]
-fn test_plug_single_keyboard() {
-    let computer = MockDeviceSource::new();
+#[tokio::test]
+async fn test_plug_single_keyboard() {
+    let computer = MockDeviceSource::new().await;
 
     let plugged_keyboard = computer.plug_keyboard();
     let keyboard_list = computer.get_keyboards();
@@ -20,9 +20,9 @@ fn test_plug_single_keyboard() {
     assert_eq!(keyboard_list[0], plugged_keyboard);
 }
 
-#[test]
-fn test_unplug_keyboard() {
-    let computer = MockDeviceSource::new();
+#[tokio::test]
+async fn test_unplug_keyboard() {
+    let computer = MockDeviceSource::new().await;
     let plugged_keyboard = computer.plug_keyboard();
 
     assert_eq!(computer.get_keyboards().len(), 1);
@@ -32,9 +32,9 @@ fn test_unplug_keyboard() {
     assert!(computer.get_keyboards().is_empty());
 }
 
-#[test]
-fn test_multiple_keyboards() {
-    let computer = MockDeviceSource::new();
+#[tokio::test]
+async fn test_multiple_keyboards() {
+    let computer = MockDeviceSource::new().await;
     let expected_keyboards: Vec<_> = (0..5).map(|_| computer.plug_keyboard()).collect();
 
     let keyboard_list = computer.get_keyboards();
@@ -43,9 +43,9 @@ fn test_multiple_keyboards() {
     assert_eq!(keyboard_list, expected_keyboards);
 }
 
-#[test]
-fn test_unplug_specific_keyboard_among_many() {
-    let computer = MockDeviceSource::new();
+#[tokio::test]
+async fn test_unplug_specific_keyboard_among_many() {
+    let computer = MockDeviceSource::new().await;
     let kb1 = computer.plug_keyboard();
     let kb2 = computer.plug_keyboard();
     let kb3 = computer.plug_keyboard();

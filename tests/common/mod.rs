@@ -2,7 +2,6 @@
 use keyboard_identifier::keyboard_provider::{
     DeviceProvider, Keyboard, KeyboardID, PortID, ProviderEvent,
 };
-use std::future::Future;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},

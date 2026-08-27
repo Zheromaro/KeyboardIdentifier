@@ -31,7 +31,7 @@ pub enum ProviderEvent {
 }
 
 pub trait DeviceProvider {
-    async fn new() -> Self;
+    fn new() -> impl std::future::Future<Output = Self> + Send;
     fn next_event(&mut self) -> impl Future<Output = Result<ProviderEvent, std::io::Error>> + Send;
     fn get_keyboards(&self) -> Vec<Keyboard>;
 }
