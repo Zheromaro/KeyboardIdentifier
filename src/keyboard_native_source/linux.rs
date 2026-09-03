@@ -224,14 +224,29 @@ fn map_to_keyboard(udev_dev: &UdevDevice) -> Option<Keyboard> {
 
     let input_id = evdev.input_id();
 
+    let name = udev_dev
+        .property_value("ID_MODEL_FROM_DATABASE")
+        .or_else(|| udev_dev.property_value("ID_MODEL"))
+        .and_then(|v| v.to_str().map(String::from))
+        .or_else(|| evdev.name().map(String::from));
+
     Some(Keyboard {
         keyboard_id: KeyboardID {
-            name: evdev.name().map(String::from),
+            name,
             vendor_id: Some(format!("{:04x}", input_id.vendor())),
             product_id: Some(format!("{:04x}", input_id.product())),
             serial: udev_dev
                 .property_value("ID_SERIAL_SHORT")
-                .and_then(|v| v.to_str().map(String::from)),
+                .or_else(|| udev_dev.property_value("ID_SERIAL"))
+                .and_then(|v| {
+                    let s = v.to_str()?;
+                    // Treat udev's "noserial" placeholder the same as a missing serial
+                    if s.eq_ignore_ascii_case("noserial") || s.is_empty() {
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
+                }),
         },
         port_id: PortID {
             physical_path: udev_dev.syspath().to_str().map(String::from),

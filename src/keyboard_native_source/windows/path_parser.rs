@@ -29,11 +29,9 @@ impl KeyboardPathParser {
         let vendor_id = Self::extract_hex(hardware_id, "VID_");
         let product_id = Self::extract_hex(hardware_id, "PID_");
 
-        let serial = parts
-            .get(2)
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
+        // Do NOT use the Windows instance ID as the serial number.
+        // The real serial (if present) is read later via HidD_GetSerialNumberString.
+        let serial = None;
 
         (vendor_id, product_id, serial)
     }
@@ -52,9 +50,13 @@ impl KeyboardPathParser {
             .unwrap_or(value.len());
 
         if end == 0 {
-            None
-        } else {
-            Some(value[..end].to_ascii_uppercase())
+            return None;
         }
+
+        // Normalize to 4-digit lowercase hex for cross-platform consistency
+        let hex_str = &value[..end];
+        u16::from_str_radix(hex_str, 16)
+            .ok()
+            .map(|id| format!("{:04x}", id))
     }
 }

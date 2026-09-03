@@ -1,6 +1,18 @@
+use std::fmt;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortID {
     pub physical_path: Option<String>,
+}
+
+impl fmt::Display for PortID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "PortID {{ physical_path: {} }}",
+            self.physical_path.as_deref().unwrap_or("None")
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,15 +23,32 @@ pub struct KeyboardID {
     pub serial: Option<String>,
 }
 
+impl fmt::Display for KeyboardID {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "KeyboardID {{ name: {}, vendor_id: {}, product_id: {}, serial: {} }}",
+            self.name.as_deref().unwrap_or("None"),
+            self.vendor_id.as_deref().unwrap_or("None"),
+            self.product_id.as_deref().unwrap_or("None"),
+            self.serial.as_deref().unwrap_or("None"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keyboard {
     pub keyboard_id: KeyboardID,
     pub port_id: PortID,
 }
 
-impl Keyboard {
-    pub fn as_str(&self) -> String {
-        format!("{:?}", self)
+impl fmt::Display for Keyboard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Keyboard {{ keyboard_id: {}, port_id: {} }}",
+            self.keyboard_id, self.port_id
+        )
     }
 }
 
@@ -30,6 +59,17 @@ pub enum KeyboardEvent {
     Pressed(Keyboard),
 }
 
+impl fmt::Display for KeyboardEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyboardEvent::Plugged(kb) => write!(f, "Plugged({})", kb),
+            KeyboardEvent::Unplugged(kb) => write!(f, "Unplugged({})", kb),
+            KeyboardEvent::Pressed(kb) => write!(f, "Pressed({})", kb),
+        }
+    }
+}
+
+// The rest of the code (KeyboardSource trait) remains unchanged.
 pub trait KeyboardSource {
     fn new() -> impl Future<Output = Self> + Send;
     fn get_keyboards(&self) -> Vec<Keyboard>;
