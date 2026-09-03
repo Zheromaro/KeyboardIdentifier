@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use keyboard_identifier::keyboard_provider::DeviceProvider;
+use keyboard_identifier::keyboard_source::*;
 
 #[tokio::test]
 async fn test_no_keyboards() {
@@ -19,7 +19,6 @@ async fn test_plug_single_keyboard() {
     assert_eq!(keyboard_list.len(), 1);
     assert_eq!(keyboard_list[0], plugged_keyboard);
 }
-
 #[tokio::test]
 async fn test_unplug_keyboard() {
     let computer = MockDeviceSource::new().await;

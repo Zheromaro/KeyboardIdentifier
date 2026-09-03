@@ -1,7 +1,6 @@
 mod common;
 use common::*;
-use keyboard_identifier::keyboard_provider::DeviceProvider;
-use keyboard_identifier::*;
+use keyboard_identifier::{keyboard_source::*, *};
 
 #[tokio::test]
 async fn test_no_unplug() {
@@ -13,7 +12,7 @@ async fn test_no_unplug() {
     listener.on_unplugged(move |_| {
         let _ = tx.send(());
     });
-    listener.listen_with(computer).await;
+    listener.listen(computer);
     tokio::task::yield_now().await;
 
     // Keyboard was plugged in, but never unplugged
@@ -30,7 +29,7 @@ async fn test_one_unplug_one_job() {
     listener.on_unplugged(move |_| {
         let _ = tx.send(());
     });
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     computer.unplug_keyboard(&keyboard);
@@ -50,7 +49,7 @@ async fn test_two_unplugs_one_job() {
     listener.on_unplugged(move |_| {
         let _ = tx.send(());
     });
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     computer.unplug_keyboard(&kb1);
@@ -78,7 +77,7 @@ async fn test_one_unplug_two_jobs() {
         let _ = tx2.send("job2");
     });
 
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     computer.unplug_keyboard(&keyboard);
@@ -101,7 +100,7 @@ async fn test_unplugged_id_verification() {
         let _ = tx.send(kb.keyboard_id.clone());
     });
 
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     computer.unplug_keyboard(&keyboard);

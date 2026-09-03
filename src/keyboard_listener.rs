@@ -1,10 +1,9 @@
-use crate::keyboard_provider::*;
-use crate::platforms::*;
+use crate::keyboard_source::*;
 use crate::registry::*;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-pub type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
+type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
 
 pub struct KeyboardListener {
     on_pressed: Registry<Callback>,
@@ -37,12 +36,7 @@ impl KeyboardListener {
         self.on_pressed.register(Arc::new(callback));
     }
 
-    pub async fn listen(&self) {
-        let provider = NativeDeviceProvider::new().await;
-        self.listen_with(provider).await;
-    }
-
-    pub async fn listen_with<D: DeviceProvider + Send + 'static>(&self, mut provider: D) {
+    pub fn listen<D: KeyboardSource + Send + 'static>(&self, mut provider: D) {
         let on_pressed = self.on_pressed.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();
@@ -51,19 +45,24 @@ impl KeyboardListener {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    biased; // Prioritize shutdown signals
+                    biased;
                     _ = shutdown.recv() => break,
-                    Ok(event) = provider.next_event() => {
-                        match event {
-                            ProviderEvent::Plugged(kb) => {
+                    res = provider.receive_event() => {
+                        match res {
+                            Ok(KeyboardEvent::Plugged(kb)) => {
                                 on_plugged.for_each(|cb| cb(&kb));
                             }
-                            ProviderEvent::Unplugged(kb) => {
+                            Ok(KeyboardEvent::Unplugged(kb)) => {
                                 on_unplugged.for_each(|cb| cb(&kb));
                             }
-                            ProviderEvent::Pressed(kb) => {
+                            Ok(KeyboardEvent::Pressed(kb)) => {
                                 on_pressed.for_each(|cb| cb(&kb));
-                            }                        }
+                            }
+                            Err(e) => {
+                                eprintln!("Keyboard source error: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
             }

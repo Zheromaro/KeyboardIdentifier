@@ -1,7 +1,6 @@
 mod common;
 use common::*;
-use keyboard_identifier::keyboard_provider::DeviceProvider;
-use keyboard_identifier::*;
+use keyboard_identifier::{keyboard_source::*, *};
 
 #[tokio::test]
 async fn test_listen_routes_all_events() {
@@ -26,7 +25,7 @@ async fn test_listen_routes_all_events() {
     });
 
     // Start listening
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     // Trigger all three events in sequence
@@ -55,7 +54,7 @@ async fn test_listen_shuts_down_on_drop() {
         listener.on_plugged(move |_| {
             let _ = tx_plugged.send("plugged");
         });
-        listener.listen_with(computer.clone()).await;
+        listener.listen(computer.clone());
         tokio::task::yield_now().await;
 
         // Trigger an event to prove the listener is currently active

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use keyboard_identifier::keyboard_provider::{
-    DeviceProvider, Keyboard, KeyboardID, PortID, ProviderEvent,
+use keyboard_identifier::keyboard_source::{
+    Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID,
 };
 use std::sync::{
     Arc, Mutex,
@@ -15,9 +15,9 @@ use tokio::time::timeout;
 pub struct MockDeviceSource {
     devices: Arc<Mutex<Vec<Keyboard>>>,
     next_id: Arc<AtomicUsize>,
-    tx: UnboundedSender<ProviderEvent>,
+    tx: UnboundedSender<KeyboardEvent>,
     // Wrapped in an async mutex so it can be mutated via the immutable `&self` reference in next_event()
-    rx: Arc<AsyncMutex<UnboundedReceiver<ProviderEvent>>>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<KeyboardEvent>>>,
 }
 
 impl MockDeviceSource {
@@ -38,7 +38,7 @@ impl MockDeviceSource {
 
         // Store the device and notify the plugged listener
         self.devices.lock().unwrap().push(keyboard.clone());
-        let _ = self.tx.send(ProviderEvent::Plugged(keyboard.clone()));
+        let _ = self.tx.send(KeyboardEvent::Plugged(keyboard.clone()));
 
         keyboard
     }
@@ -46,16 +46,16 @@ impl MockDeviceSource {
     pub fn unplug_keyboard(&self, keyboard: &Keyboard) {
         self.devices.lock().unwrap().retain(|dev| dev != keyboard);
 
-        let _ = self.tx.send(ProviderEvent::Unplugged(keyboard.clone()));
+        let _ = self.tx.send(KeyboardEvent::Unplugged(keyboard.clone()));
     }
 
     pub fn press(&self, keyboard: &Keyboard) {
         // Send a pressed event directly into the stream
-        let _ = self.tx.send(ProviderEvent::Pressed(keyboard.clone()));
+        let _ = self.tx.send(KeyboardEvent::Pressed(keyboard.clone()));
     }
 }
 
-impl DeviceProvider for MockDeviceSource {
+impl KeyboardSource for MockDeviceSource {
     async fn new() -> Self {
         let (tx, rx) = unbounded_channel();
         Self {
@@ -66,7 +66,7 @@ impl DeviceProvider for MockDeviceSource {
         }
     }
 
-    async fn next_event(&mut self) -> Result<ProviderEvent, std::io::Error> {
+    async fn receive_event(&mut self) -> Result<KeyboardEvent, std::io::Error> {
         self.rx
             .lock()
             .await

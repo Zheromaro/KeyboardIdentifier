@@ -1,7 +1,6 @@
 mod common;
 use common::*;
-use keyboard_identifier::keyboard_provider::DeviceProvider;
-use keyboard_identifier::*;
+use keyboard_identifier::{keyboard_source::*, *};
 
 #[tokio::test]
 async fn test_no_press() {
@@ -12,7 +11,7 @@ async fn test_no_press() {
     listener.on_pressed(move |_| {
         let _ = tx.send(());
     });
-    listener.listen_with(computer).await;
+    listener.listen(computer);
     tokio::task::yield_now().await;
 
     expect_timeout(&mut rx).await;
@@ -35,7 +34,7 @@ async fn test_other_keyboard_press_one_job() {
         }
     });
 
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
     computer.press(&keyboard2);
 
@@ -52,8 +51,7 @@ async fn test_one_press_one_job() {
     listener.on_pressed(move |_| {
         let _ = tx.send(());
     });
-    listener.listen_with(computer.clone()).await;
-    tokio::task::yield_now().await;
+    listener.listen(computer.clone());
     computer.press(&keyboard);
 
     expect_recv(&mut rx).await;
@@ -70,7 +68,7 @@ async fn test_two_presses_one_job() {
     listener.on_pressed(move |_| {
         let _ = tx.send(());
     });
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     computer.press(&keyboard);
@@ -102,7 +100,7 @@ async fn test_one_press_two_jobs() {
         let _ = tx2.send("job2");
     });
 
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
     computer.press(&keyboard);
 
@@ -130,7 +128,7 @@ async fn test_two_presses_two_jobs() {
         let _ = tx2.send("job2");
     });
 
-    listener.listen_with(computer.clone()).await;
+    listener.listen(computer.clone());
     tokio::task::yield_now().await;
 
     computer.press(&keyboard);
