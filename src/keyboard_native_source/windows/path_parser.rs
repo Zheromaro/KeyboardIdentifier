@@ -3,23 +3,21 @@ use crate::keyboard_source::{Keyboard, KeyboardID, PortID};
 pub(crate) struct KeyboardPathParser;
 
 impl KeyboardPathParser {
-    pub(crate) fn parse(path: &str) -> Keyboard {
-        let (vendor_id, product_id, serial) = Self::parse_hid_path(path);
+    pub(crate) fn parse(path: &str, physical_path: Option<String>) -> Keyboard {
+        let (vendor_id, product_id) = Self::parse_hid_path(path);
 
         Keyboard {
             keyboard_id: KeyboardID {
                 name: None,
                 vendor_id,
                 product_id,
-                serial,
+                serial: None,
             },
-            port_id: PortID {
-                physical_path: Some(path.to_owned()),
-            },
+            port_id: PortID { physical_path },
         }
     }
 
-    fn parse_hid_path(path: &str) -> (Option<String>, Option<String>, Option<String>) {
+    fn parse_hid_path(path: &str) -> (Option<String>, Option<String>) {
         let parts: Vec<&str> = path.split('#').collect();
 
         // Typical path:
@@ -29,11 +27,7 @@ impl KeyboardPathParser {
         let vendor_id = Self::extract_hex(hardware_id, "VID_");
         let product_id = Self::extract_hex(hardware_id, "PID_");
 
-        // Do NOT use the Windows instance ID as the serial number.
-        // The real serial (if present) is read later via HidD_GetSerialNumberString.
-        let serial = None;
-
-        (vendor_id, product_id, serial)
+        (vendor_id, product_id)
     }
 
     fn extract_hex(value: &str, prefix: &str) -> Option<String> {
@@ -53,10 +47,10 @@ impl KeyboardPathParser {
             return None;
         }
 
-        // Normalize to 4-digit lowercase hex for cross-platform consistency
         let hex_str = &value[..end];
+
         u16::from_str_radix(hex_str, 16)
             .ok()
-            .map(|id| format!("{:04x}", id))
+            .map(|id| format!("{id:04x}"))
     }
 }

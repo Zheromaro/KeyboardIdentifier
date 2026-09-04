@@ -14,7 +14,6 @@ const PRESSED: i32 = 1;
 pub struct LinuxKeyboardSource {
     receiver: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
     shutdown: broadcast::Sender<()>,
-    task: JoinHandle<()>,
 }
 
 impl KeyboardSource for LinuxKeyboardSource {
@@ -22,18 +21,15 @@ impl KeyboardSource for LinuxKeyboardSource {
         let (sender, receiver) = mpsc::channel(128);
         let (shutdown, _) = broadcast::channel(1);
 
-        let task = tokio::spawn(udev_loop(sender, shutdown.subscribe()));
+        tokio::spawn(udev_loop(sender, shutdown.subscribe()));
 
-        Self {
-            receiver,
-            shutdown,
-            task,
-        }
+        Self { receiver, shutdown }
     }
 
     async fn receive_event(&mut self) -> Result<KeyboardEvent, io::Error> {
         match self.receiver.recv().await {
             Some(result) => result,
+
             None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Linux device event channel closed",
@@ -59,8 +55,6 @@ impl KeyboardSource for LinuxKeyboardSource {
 impl Drop for LinuxKeyboardSource {
     fn drop(&mut self) {
         let _ = self.shutdown.send(());
-
-        self.task.abort();
     }
 }
 
@@ -70,6 +64,7 @@ async fn udev_loop(
 ) {
     let monitor = match create_monitor().and_then(AsyncFd::new) {
         Ok(monitor) => monitor,
+
         Err(error) => {
             let _ = sender.send(Err(error)).await;
             return;
@@ -87,6 +82,7 @@ async fn udev_loop(
 
         Err(error) => {
             if sender.send(Err(error)).await.is_err() {
+                shutdown_evdev_tasks(keyboards);
                 return;
             }
         }
@@ -111,13 +107,12 @@ async fn udev_loop(
                 };
 
                 for event in guard.get_inner().iter() {
-                    if !handle_udev_event(
+                    handle_udev_event(
                         event,
                         &mut keyboards,
                         &sender,
-                    ).await {
-                        break;
-                    }
+                    )
+                    .await;
                 }
 
                 guard.clear_ready();
@@ -125,7 +120,11 @@ async fn udev_loop(
         }
     }
 
-    for (_, handle) in keyboards.into_values() {
+    shutdown_evdev_tasks(keyboards);
+}
+
+fn shutdown_evdev_tasks(keyboards: HashMap<PathBuf, (Keyboard, JoinHandle<()>)>) {
+    for (_, (_, handle)) in keyboards {
         handle.abort();
     }
 }
@@ -138,49 +137,47 @@ async fn handle_udev_event(
     event: udev::Event,
     keyboards: &mut HashMap<PathBuf, (Keyboard, JoinHandle<()>)>,
     sender: &mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-) -> bool {
+) {
     let dev = event.device();
 
     let Some(devnode) = dev.devnode().map(PathBuf::from) else {
-        return true;
+        return;
     };
 
     match event.event_type() {
         EventType::Add => {
             if dev.property_value("ID_INPUT_KEYBOARD").is_none() {
-                return true;
+                return;
             }
 
             let Some(keyboard) = map_to_keyboard(&dev) else {
-                return true;
+                return;
             };
 
             if keyboards.contains_key(&devnode) {
-                return true;
+                return;
             }
 
-            spawn_evdev(keyboards, devnode, keyboard.clone(), sender);
-
-            sender
-                .send(Ok(KeyboardEvent::Plugged(keyboard)))
+            if sender
+                .send(Ok(KeyboardEvent::Plugged(keyboard.clone())))
                 .await
-                .is_ok()
+                .is_err()
+            {
+                return;
+            }
+
+            spawn_evdev(keyboards, devnode, keyboard, sender);
         }
 
         EventType::Remove => {
             if let Some((keyboard, handle)) = keyboards.remove(&devnode) {
                 handle.abort();
 
-                return sender
-                    .send(Ok(KeyboardEvent::Unplugged(keyboard)))
-                    .await
-                    .is_ok();
+                let _ = sender.send(Ok(KeyboardEvent::Unplugged(keyboard))).await;
             }
-
-            true
         }
 
-        _ => true,
+        _ => {}
     }
 }
 
@@ -228,7 +225,6 @@ async fn evdev_loop(
                 if error.raw_os_error() != Some(ENODEV) {
                     eprintln!("evdev error for {devnode:?}: {error}");
                 }
-
                 break;
             }
         };
@@ -257,7 +253,6 @@ fn enumerate_keyboards() -> Result<Vec<(PathBuf, Keyboard)>, io::Error> {
         .filter(|device| device.property_value("ID_INPUT_KEYBOARD").is_some())
         .filter_map(|device| {
             let devnode = device.devnode().map(PathBuf::from)?;
-
             let keyboard = map_to_keyboard(&device)?;
 
             Some((devnode, keyboard))
@@ -283,35 +278,29 @@ fn map_to_keyboard(udev_dev: &UdevDevice) -> Option<Keyboard> {
     let name = udev_dev
         .property_value("ID_MODEL_FROM_DATABASE")
         .or_else(|| udev_dev.property_value("ID_MODEL"))
-        .and_then(|value| value.to_str().map(String::from))
-        .or_else(|| evdev.name().map(String::from));
+        .and_then(|value| value.to_str().map(str::to_owned))
+        .or_else(|| evdev.name().map(str::to_owned));
 
     let serial = udev_dev
         .property_value("ID_SERIAL_SHORT")
-        .or_else(|| udev_dev.property_value("ID_SERIAL"))
-        .and_then(|value| {
-            let serial = value.to_str()?;
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("noserial"))
+        .map(str::to_owned);
 
-            if serial.is_empty() || serial.eq_ignore_ascii_case("noserial") {
-                None
-            } else {
-                Some(serial.to_string())
-            }
-        });
+    let physical_path = udev_dev
+        .property_value("ID_PATH")
+        .and_then(|value| value.to_str())
+        .map(str::to_owned)
+        .or_else(|| udev_dev.syspath().to_str().map(str::to_owned));
 
     Some(Keyboard {
         keyboard_id: KeyboardID {
             name,
-
             vendor_id: Some(format!("{:04x}", input_id.vendor())),
-
             product_id: Some(format!("{:04x}", input_id.product())),
-
             serial,
         },
 
-        port_id: PortID {
-            physical_path: udev_dev.syspath().to_str().map(String::from),
-        },
+        port_id: PortID { physical_path },
     })
 }
