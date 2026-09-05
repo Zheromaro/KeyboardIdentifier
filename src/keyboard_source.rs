@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, io};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortID {
@@ -69,9 +69,8 @@ impl fmt::Display for KeyboardEvent {
     }
 }
 
-// The rest of the code (KeyboardSource trait) remains unchanged.
-pub trait KeyboardSource {
-    fn new() -> impl Future<Output = Self> + Send;
+pub trait KeyboardSource: Sized {
+    fn new() -> impl Future<Output = io::Result<Self>> + Send;
     fn get_keyboards(&self) -> Vec<Keyboard>;
     fn receive_event(
         &mut self,

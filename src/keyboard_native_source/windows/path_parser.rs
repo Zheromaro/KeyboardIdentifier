@@ -18,16 +18,12 @@ impl KeyboardPathParser {
     }
 
     fn parse_hid_path(path: &str) -> (Option<String>, Option<String>) {
-        let parts: Vec<&str> = path.split('#').collect();
+        let hardware_id = path.split('#').nth(1).unwrap_or_default();
 
-        // Typical path:
-        // \\?\HID#VID_1234&PID_5678&MI_00#INSTANCE#{GUID}
-        let hardware_id = parts.get(1).copied().unwrap_or_default();
-
-        let vendor_id = Self::extract_hex(hardware_id, "VID_");
-        let product_id = Self::extract_hex(hardware_id, "PID_");
-
-        (vendor_id, product_id)
+        (
+            Self::extract_hex(hardware_id, "VID_"),
+            Self::extract_hex(hardware_id, "PID_"),
+        )
     }
 
     fn extract_hex(value: &str, prefix: &str) -> Option<String> {
@@ -47,9 +43,9 @@ impl KeyboardPathParser {
             return None;
         }
 
-        let hex_str = &value[..end];
+        let hex = &value[..end];
 
-        u16::from_str_radix(hex_str, 16)
+        u16::from_str_radix(hex, 16)
             .ok()
             .map(|id| format!("{id:04x}"))
     }

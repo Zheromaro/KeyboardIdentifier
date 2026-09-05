@@ -4,14 +4,14 @@ use keyboard_identifier::{keyboard_source::*, *};
 
 #[tokio::test]
 async fn test_no_plugged() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let listener = KeyboardListener::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_plugged(move |_| {
         let _ = tx.send(());
     });
-    listener.listen(computer);
+    listener.listen(computer).await;
     tokio::task::yield_now().await;
 
     // No keyboards are plugged in, so this should time out.
@@ -20,14 +20,14 @@ async fn test_no_plugged() {
 
 #[tokio::test]
 async fn test_one_plugged_one_job() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let listener = KeyboardListener::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_plugged(move |_| {
         let _ = tx.send(());
     });
-    listener.listen(computer.clone());
+    listener.listen(computer.clone()).await;
 
     // Crucial: yield to let the listener task start BEFORE plugging the keyboard
     tokio::task::yield_now().await;
@@ -40,14 +40,14 @@ async fn test_one_plugged_one_job() {
 
 #[tokio::test]
 async fn test_two_plugged_one_job() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let listener = KeyboardListener::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_plugged(move |_| {
         let _ = tx.send(());
     });
-    listener.listen(computer.clone());
+    listener.listen(computer.clone()).await;
     tokio::task::yield_now().await;
 
     let _kb1 = computer.plug_keyboard();
@@ -60,7 +60,7 @@ async fn test_two_plugged_one_job() {
 
 #[tokio::test]
 async fn test_one_plugged_two_jobs() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let listener = KeyboardListener::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -74,7 +74,7 @@ async fn test_one_plugged_two_jobs() {
         let _ = tx2.send("job2");
     });
 
-    listener.listen(computer.clone());
+    listener.listen(computer.clone()).await;
     tokio::task::yield_now().await;
 
     let _keyboard = computer.plug_keyboard();
@@ -88,7 +88,7 @@ async fn test_one_plugged_two_jobs() {
 
 #[tokio::test]
 async fn test_plugged_id_verification() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let listener = KeyboardListener::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -97,7 +97,7 @@ async fn test_plugged_id_verification() {
         let _ = tx.send(kb.keyboard_id.clone());
     });
 
-    listener.listen(computer.clone());
+    listener.listen(computer.clone()).await;
     tokio::task::yield_now().await;
 
     let expected_keyboard = computer.plug_keyboard();

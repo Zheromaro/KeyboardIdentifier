@@ -17,13 +17,15 @@ pub struct LinuxKeyboardSource {
 }
 
 impl KeyboardSource for LinuxKeyboardSource {
-    async fn new() -> Self {
+    async fn new() -> io::Result<Self> {
+        let monitor = AsyncFd::new(create_monitor()?)?;
+
         let (sender, receiver) = mpsc::channel(128);
         let (shutdown, _) = broadcast::channel(1);
 
-        tokio::spawn(udev_loop(sender, shutdown.subscribe()));
+        tokio::spawn(udev_loop(monitor, sender, shutdown.subscribe()));
 
-        Self { receiver, shutdown }
+        Ok(Self { receiver, shutdown })
     }
 
     async fn receive_event(&mut self) -> Result<KeyboardEvent, io::Error> {
@@ -59,18 +61,10 @@ impl Drop for LinuxKeyboardSource {
 }
 
 async fn udev_loop(
+    monitor: AsyncFd<MonitorSocket>,
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let monitor = match create_monitor().and_then(AsyncFd::new) {
-        Ok(monitor) => monitor,
-
-        Err(error) => {
-            let _ = sender.send(Err(error)).await;
-            return;
-        }
-    };
-
     let mut keyboards: HashMap<PathBuf, (Keyboard, JoinHandle<()>)> = HashMap::new();
 
     match enumerate_keyboards() {

@@ -2,11 +2,14 @@
 use keyboard_identifier::keyboard_source::{
     Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID,
 };
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
 use std::time::Duration;
+use std::{
+    io,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::timeout;
@@ -56,14 +59,14 @@ impl MockDeviceSource {
 }
 
 impl KeyboardSource for MockDeviceSource {
-    async fn new() -> Self {
+    async fn new() -> io::Result<Self> {
         let (tx, rx) = unbounded_channel();
-        Self {
+        Ok(Self {
             devices: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicUsize::new(0)),
             tx,
             rx: Arc::new(AsyncMutex::new(rx)),
-        }
+        })
     }
 
     async fn receive_event(&mut self) -> Result<KeyboardEvent, std::io::Error> {

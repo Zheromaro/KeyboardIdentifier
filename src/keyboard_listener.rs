@@ -36,7 +36,7 @@ impl KeyboardListener {
         self.on_pressed.register(Arc::new(callback));
     }
 
-    pub fn listen<D: KeyboardSource + Send + 'static>(&self, mut provider: D) {
+    pub async fn listen<D: KeyboardSource + Send + 'static>(&self, mut provider: D) {
         let on_pressed = self.on_pressed.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();
@@ -67,6 +67,12 @@ impl KeyboardListener {
                 }
             }
         });
+    }
+}
+
+impl Default for KeyboardListener {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -1,5 +1,6 @@
 use std::io;
-use windows::Win32::Foundation::{GetLastError, HANDLE};
+
+use windows::Win32::Foundation::GetLastError;
 
 pub(crate) fn win32_error(message: &'static str) -> io::Error {
     let code = unsafe { GetLastError().0 as i32 };
@@ -12,9 +13,5 @@ pub(crate) fn win32_error(message: &'static str) -> io::Error {
 }
 
 pub(crate) fn windows_error(error: windows::core::Error) -> io::Error {
-    io::Error::other(error.to_string())
-}
-
-pub(crate) fn handle_key(handle: HANDLE) -> isize {
-    handle.0 as isize
+    io::Error::other(error)
 }

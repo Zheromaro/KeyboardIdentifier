@@ -4,7 +4,7 @@ use keyboard_identifier::{keyboard_source::*, *};
 
 #[tokio::test]
 async fn test_listen_routes_all_events() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let listener = KeyboardListener::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -25,7 +25,7 @@ async fn test_listen_routes_all_events() {
     });
 
     // Start listening
-    listener.listen(computer.clone());
+    listener.listen(computer.clone()).await;
     tokio::task::yield_now().await;
 
     // Trigger all three events in sequence
@@ -43,7 +43,7 @@ async fn test_listen_routes_all_events() {
 
 #[tokio::test]
 async fn test_listen_shuts_down_on_drop() {
-    let computer = MockDeviceSource::new().await;
+    let computer = MockDeviceSource::new().await.unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Create a local scope for the listener so we can force it to drop
@@ -54,7 +54,7 @@ async fn test_listen_shuts_down_on_drop() {
         listener.on_plugged(move |_| {
             let _ = tx_plugged.send("plugged");
         });
-        listener.listen(computer.clone());
+        listener.listen(computer.clone()).await;
         tokio::task::yield_now().await;
 
         // Trigger an event to prove the listener is currently active
