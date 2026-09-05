@@ -1,11 +1,11 @@
 mod common;
 use common::*;
-use keyboard_identifier::{keyboard_source::*, *};
+use keyboard_identifier::KeyboardManager;
 
 #[tokio::test]
 async fn test_listen_routes_all_events() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardListener::new();
+    let listener = KeyboardManager::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Register one callback for each event type, sending a distinct string
@@ -48,7 +48,7 @@ async fn test_listen_shuts_down_on_drop() {
 
     // Create a local scope for the listener so we can force it to drop
     {
-        let listener = KeyboardListener::new();
+        let listener = KeyboardManager::new();
         let tx_plugged = tx.clone();
 
         listener.on_plugged(move |_| {
@@ -75,7 +75,7 @@ async fn test_listen_shuts_down_on_drop() {
 #[tokio::test]
 async fn test_new_and_default() {
     // Verify new() initializes without panicking
-    let _listener_new = KeyboardListener::new();
+    let _listener_new = KeyboardManager::new();
 
     // If we reach here without a panic, the internal broadcast channels
     // and registries were successfully created.

@@ -1,4 +1,14 @@
-use std::{fmt, io};
+#[cfg(all(target_os = "linux"))]
+mod linux;
+#[cfg(all(target_os = "linux"))]
+pub use linux::LinuxKeyboardSource as NativeKeyboardSource;
+
+#[cfg(all(target_os = "windows"))]
+mod windows;
+#[cfg(all(target_os = "windows"))]
+pub use windows::WindowsKeyboardSource as NativeKeyboardSource;
+
+use std::{fmt, io, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortID {
@@ -54,9 +64,9 @@ impl fmt::Display for Keyboard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardEvent {
-    Plugged(Keyboard),
-    Unplugged(Keyboard),
-    Pressed(Keyboard),
+    Plugged(Arc<Keyboard>),
+    Unplugged(Arc<Keyboard>),
+    Pressed(Arc<Keyboard>),
 }
 
 impl fmt::Display for KeyboardEvent {

@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use keyboard_identifier::keyboard_source::*;
+use keyboard_identifier::KeyboardManager;
 
 #[tokio::test]
 async fn test_no_keyboards() {

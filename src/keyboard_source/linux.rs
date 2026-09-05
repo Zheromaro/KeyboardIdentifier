@@ -1,6 +1,6 @@
-use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID};
+use super::{Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID};
 use evdev::Device as EvdevDevice;
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 use tokio::{
     io::unix::AsyncFd,
     sync::{broadcast, mpsc},
@@ -43,7 +43,7 @@ impl KeyboardSource for LinuxKeyboardSource {
         match enumerate_keyboards() {
             Ok(keyboards) => keyboards
                 .into_iter()
-                .map(|(_, keyboard)| keyboard)
+                .map(|(_, keyboard)| (*keyboard).clone())
                 .collect(),
 
             Err(error) => {
@@ -65,7 +65,7 @@ async fn udev_loop(
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let mut keyboards: HashMap<PathBuf, (Keyboard, JoinHandle<()>)> = HashMap::new();
+    let mut keyboards: HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)> = HashMap::new();
 
     match enumerate_keyboards() {
         Ok(initial_keyboards) => {
@@ -117,7 +117,7 @@ async fn udev_loop(
     shutdown_evdev_tasks(keyboards);
 }
 
-fn shutdown_evdev_tasks(keyboards: HashMap<PathBuf, (Keyboard, JoinHandle<()>)>) {
+fn shutdown_evdev_tasks(keyboards: HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)>) {
     for (_, (_, handle)) in keyboards {
         handle.abort();
     }
@@ -129,7 +129,7 @@ fn create_monitor() -> io::Result<MonitorSocket> {
 
 async fn handle_udev_event(
     event: udev::Event,
-    keyboards: &mut HashMap<PathBuf, (Keyboard, JoinHandle<()>)>,
+    keyboards: &mut HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)>,
     sender: &mpsc::Sender<Result<KeyboardEvent, io::Error>>,
 ) {
     let dev = event.device();
@@ -144,7 +144,7 @@ async fn handle_udev_event(
                 return;
             }
 
-            let Some(keyboard) = map_to_keyboard(&dev) else {
+            let Some(keyboard) = map_to_keyboard(&dev).map(Arc::new) else {
                 return;
             };
 
@@ -176,9 +176,9 @@ async fn handle_udev_event(
 }
 
 fn spawn_evdev(
-    keyboards: &mut HashMap<PathBuf, (Keyboard, JoinHandle<()>)>,
+    keyboards: &mut HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)>,
     devnode: PathBuf,
-    keyboard: Keyboard,
+    keyboard: Arc<Keyboard>,
     sender: &mpsc::Sender<Result<KeyboardEvent, io::Error>>,
 ) {
     if keyboards.contains_key(&devnode) {
@@ -198,7 +198,7 @@ fn spawn_evdev(
 
 async fn evdev_loop(
     devnode: PathBuf,
-    keyboard: Keyboard,
+    keyboard: Arc<Keyboard>,
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
 ) {
     let mut stream = match EvdevDevice::open(&devnode).and_then(|device| device.into_event_stream())
@@ -237,7 +237,7 @@ async fn evdev_loop(
     }
 }
 
-fn enumerate_keyboards() -> Result<Vec<(PathBuf, Keyboard)>, io::Error> {
+fn enumerate_keyboards() -> Result<Vec<(PathBuf, Arc<Keyboard>)>, io::Error> {
     let mut enumerator = Enumerator::new()?;
 
     enumerator.match_subsystem("input")?;
@@ -247,7 +247,7 @@ fn enumerate_keyboards() -> Result<Vec<(PathBuf, Keyboard)>, io::Error> {
         .filter(|device| device.property_value("ID_INPUT_KEYBOARD").is_some())
         .filter_map(|device| {
             let devnode = device.devnode().map(PathBuf::from)?;
-            let keyboard = map_to_keyboard(&device)?;
+            let keyboard = Arc::new(map_to_keyboard(&device)?);
 
             Some((devnode, keyboard))
         })

@@ -8,13 +8,9 @@ mod path_parser;
 mod raw_input;
 mod setup_api;
 mod window;
-
-use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource};
-
+use super::{Keyboard, KeyboardEvent, KeyboardSource};
 use input_thread::{InputThread, RawInputOwner};
-
 use std::io;
-
 use tokio::sync::{mpsc, oneshot};
 
 pub struct WindowsKeyboardSource {

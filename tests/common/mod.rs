@@ -16,10 +16,9 @@ use tokio::time::timeout;
 
 #[derive(Clone)]
 pub struct MockDeviceSource {
-    devices: Arc<Mutex<Vec<Keyboard>>>,
+    devices: Arc<Mutex<Vec<Arc<Keyboard>>>>,
     next_id: Arc<AtomicUsize>,
     tx: UnboundedSender<KeyboardEvent>,
-    // Wrapped in an async mutex so it can be mutated via the immutable `&self` reference in next_event()
     rx: Arc<AsyncMutex<UnboundedReceiver<KeyboardEvent>>>,
 }
 
@@ -27,7 +26,7 @@ impl MockDeviceSource {
     pub fn plug_keyboard(&self) -> Keyboard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        let keyboard = Keyboard {
+        let keyboard = Arc::new(Keyboard {
             keyboard_id: KeyboardID {
                 name: Some(format!("Mock Keyboard {id}")),
                 vendor_id: Some("MOCK".into()),
@@ -37,24 +36,27 @@ impl MockDeviceSource {
             port_id: PortID {
                 physical_path: Some(format!("/mock/keyboard/{id}")),
             },
-        };
+        });
 
-        // Store the device and notify the plugged listener
         self.devices.lock().unwrap().push(keyboard.clone());
         let _ = self.tx.send(KeyboardEvent::Plugged(keyboard.clone()));
 
-        keyboard
+        (*keyboard).clone()
     }
 
     pub fn unplug_keyboard(&self, keyboard: &Keyboard) {
-        self.devices.lock().unwrap().retain(|dev| dev != keyboard);
-
-        let _ = self.tx.send(KeyboardEvent::Unplugged(keyboard.clone()));
+        let mut devices = self.devices.lock().unwrap();
+        if let Some(pos) = devices.iter().position(|dev| **dev == *keyboard) {
+            let keyboard_arc = devices.remove(pos);
+            let _ = self.tx.send(KeyboardEvent::Unplugged(keyboard_arc));
+        }
     }
 
     pub fn press(&self, keyboard: &Keyboard) {
-        // Send a pressed event directly into the stream
-        let _ = self.tx.send(KeyboardEvent::Pressed(keyboard.clone()));
+        let devices = self.devices.lock().unwrap();
+        if let Some(dev) = devices.iter().find(|dev| ***dev == *keyboard) {
+            let _ = self.tx.send(KeyboardEvent::Pressed(dev.clone()));
+        }
     }
 }
 
@@ -69,6 +71,15 @@ impl KeyboardSource for MockDeviceSource {
         })
     }
 
+    fn get_keyboards(&self) -> Vec<Keyboard> {
+        self.devices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|k| (**k).clone())
+            .collect()
+    }
+
     async fn receive_event(&mut self) -> Result<KeyboardEvent, std::io::Error> {
         self.rx
             .lock()
@@ -77,13 +88,9 @@ impl KeyboardSource for MockDeviceSource {
             .await
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "channel closed"))
     }
-
-    fn get_keyboards(&self) -> Vec<Keyboard> {
-        self.devices.lock().unwrap().clone()
-    }
 }
 
-// ==== healpers ====
+// ==== helpers ====
 pub async fn expect_recv<T>(rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>) -> T {
     timeout(Duration::from_millis(100), rx.recv())
         .await

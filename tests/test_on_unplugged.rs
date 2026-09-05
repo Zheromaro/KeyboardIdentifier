@@ -6,7 +6,7 @@ use keyboard_identifier::{keyboard_source::*, *};
 async fn test_no_unplug() {
     let computer = MockDeviceSource::new().await.unwrap();
     let _keyboard = computer.plug_keyboard();
-    let listener = KeyboardListener::new();
+    let listener = KeyboardManager::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_unplugged(move |_| {
@@ -23,7 +23,7 @@ async fn test_no_unplug() {
 async fn test_one_unplug_one_job() {
     let computer = MockDeviceSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
-    let listener = KeyboardListener::new();
+    let listener = KeyboardManager::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_unplugged(move |_| {
@@ -43,7 +43,7 @@ async fn test_two_unplugs_one_job() {
     let computer = MockDeviceSource::new().await.unwrap();
     let kb1 = computer.plug_keyboard();
     let kb2 = computer.plug_keyboard();
-    let listener = KeyboardListener::new();
+    let listener = KeyboardManager::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_unplugged(move |_| {
@@ -64,7 +64,7 @@ async fn test_two_unplugs_one_job() {
 async fn test_one_unplug_two_jobs() {
     let computer = MockDeviceSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
-    let listener = KeyboardListener::new();
+    let listener = KeyboardManager::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let tx1 = tx.clone();
@@ -93,7 +93,7 @@ async fn test_one_unplug_two_jobs() {
 async fn test_unplugged_id_verification() {
     let computer = MockDeviceSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
-    let listener = KeyboardListener::new();
+    let listener = KeyboardManager::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     listener.on_unplugged(move |kb| {
