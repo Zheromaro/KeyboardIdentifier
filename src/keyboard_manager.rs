@@ -1,12 +1,12 @@
 use crate::keyboard_source::*;
 use crate::registry::*;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
 
 pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
-    provider: Mutex<Option<P>>,
+    provider: Option<P>,
     active_keyboards: Arc<RwLock<Vec<Keyboard>>>,
     on_pressed: Registry<Callback>,
     on_plugged: Registry<Callback>,
@@ -16,7 +16,18 @@ pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
 
 impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
     pub fn get_keyboards(&self) -> Vec<Keyboard> {
-        self.active_keyboards.read().unwrap().clone()
+        match self.provider.as_ref() {
+            Some(p) => {
+                let keyboards = p.get_keyboards();
+
+                if let Ok(mut active_keyboards) = self.active_keyboards.write() {
+                    *active_keyboards = keyboards.clone();
+                }
+
+                keyboards
+            }
+            None => self.active_keyboards.read().unwrap().clone(),
+        }
     }
 
     pub fn on_plugged<F>(&self, callback: F)
@@ -40,8 +51,8 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         self.on_pressed.register(Arc::new(callback));
     }
 
-    pub fn listen(&self) {
-        let Some(mut provider) = self.provider.lock().unwrap().take() else {
+    pub async fn listen(&mut self) {
+        let Some(mut provider) = self.provider.take() else {
             eprintln!("listen() can only be called once");
             return;
         };
@@ -102,7 +113,7 @@ impl KeyboardManager {
         let (shutdown, _) = broadcast::channel(1);
 
         Ok(Self {
-            provider: Mutex::new(Some(provider)),
+            provider: Some(provider),
             active_keyboards: Arc::new(RwLock::new(initial_keyboards)),
             on_pressed: Registry::new(),
             on_plugged: Registry::new(),
@@ -118,7 +129,7 @@ impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
         let (shutdown, _) = broadcast::channel(1);
 
         Self {
-            provider: Mutex::new(Some(provider)),
+            provider: Some(provider),
             active_keyboards: Arc::new(RwLock::new(initial_keyboards)),
             on_pressed: Registry::new(),
             on_plugged: Registry::new(),

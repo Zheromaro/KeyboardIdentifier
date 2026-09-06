@@ -1,11 +1,11 @@
 mod common;
 use common::*;
-use keyboard_identifier::KeyboardManager;
+use keyboard_identifier::{KeyboardManager, keyboard_source::KeyboardSource};
 
 #[tokio::test]
 async fn test_listen_routes_all_events() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardManager::new();
+    let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Register one callback for each event type, sending a distinct string
@@ -25,7 +25,7 @@ async fn test_listen_routes_all_events() {
     });
 
     // Start listening
-    listener.listen(computer.clone()).await;
+    listener.listen().await;
     tokio::task::yield_now().await;
 
     // Trigger all three events in sequence
@@ -48,13 +48,13 @@ async fn test_listen_shuts_down_on_drop() {
 
     // Create a local scope for the listener so we can force it to drop
     {
-        let listener = KeyboardManager::new();
+        let mut listener = KeyboardManager::from(computer.clone());
         let tx_plugged = tx.clone();
 
         listener.on_plugged(move |_| {
             let _ = tx_plugged.send("plugged");
         });
-        listener.listen(computer.clone()).await;
+        listener.listen().await;
         tokio::task::yield_now().await;
 
         // Trigger an event to prove the listener is currently active
