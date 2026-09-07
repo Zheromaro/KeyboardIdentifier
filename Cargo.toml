@@ -1,10 +1,19 @@
 [package]
 name = "keyboard_identifier"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.97.1"
+description = "Async keyboard enumeration and hotplug events for Linux and Windows"
+license = "MIT"
+repository = "https://github.com/Zheromaro/keyboard_identifier"
+homepage = "https://github.com/Zheromaro/keyboard_identifier"
+documentation = "https://docs.rs/keyboard_identifier"
+keywords = ["keyboard", "input", "hid", "hardware", "async"]
+categories = ["hardware-support", "os::linux-apis", "os::windows-apis"]
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "rt-multi-thread"] }
+tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { version = "0.13.2", features = ["device-test", "futures-core", "serde", "stream-trait", "tokio"] }

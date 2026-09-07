@@ -2,6 +2,7 @@ use crate::keyboard_source::*;
 use crate::registry::*;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
+use tracing::{error, warn};
 
 type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
 
@@ -53,7 +54,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
 
     pub async fn listen(&mut self) {
         let Some(mut provider) = self.provider.take() else {
-            eprintln!("listen() can only be called once");
+            warn!("listen() can only be called once");
             return;
         };
 
@@ -97,7 +98,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
                     }
 
                     Err(e) => {
-                        eprintln!("Keyboard source error: {}", e);
+                        error!(error = %e, "keyboard source error");
                         break;
                     }
                 }

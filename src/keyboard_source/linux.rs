@@ -6,6 +6,7 @@ use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
 };
+use tracing::error;
 use udev::{Device as UdevDevice, Enumerator, EventType, MonitorBuilder, MonitorSocket};
 
 const ENODEV: i32 = 19;
@@ -47,7 +48,7 @@ impl KeyboardSource for LinuxKeyboardSource {
                 .collect(),
 
             Err(error) => {
-                eprintln!("Failed to enumerate Linux keyboards: {error}");
+                error!(error = %error, "Failed to enumerate Linux keyboards");
                 Vec::new()
             }
         }
@@ -217,7 +218,11 @@ async fn evdev_loop(
 
             Err(error) => {
                 if error.raw_os_error() != Some(ENODEV) {
-                    eprintln!("evdev error for {devnode:?}: {error}");
+                    error!(
+                        error = %error,
+                        devnode = ?devnode,
+                        "evdev error",
+                    );
                 }
                 break;
             }
@@ -261,7 +266,11 @@ fn map_to_keyboard(udev_dev: &UdevDevice) -> Option<Keyboard> {
         Ok(device) => device,
 
         Err(error) => {
-            eprintln!("Failed to open evdev device at {devnode:?}: {error}");
+            error!(
+                error = %error,
+                devnode = ?devnode,
+                "failed open evdev device error",
+            );
 
             return None;
         }

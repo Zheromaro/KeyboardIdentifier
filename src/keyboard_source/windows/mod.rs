@@ -3,19 +3,20 @@ mod errors;
 mod handles;
 mod hid;
 mod input_thread;
-mod keyboard_state;
 mod path_parser;
 mod raw_input;
 mod setup_api;
 mod window;
+
 use super::{Keyboard, KeyboardEvent, KeyboardSource};
 use input_thread::{InputThread, RawInputOwner};
 use std::io;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 pub struct WindowsKeyboardSource {
     events: mpsc::UnboundedReceiver<KeyboardEvent>,
-    keyboards: Vec<Keyboard>,
+    keyboards: Vec<Arc<Keyboard>>,
     _owner: RawInputOwner,
     thread: Option<InputThread>,
 }
@@ -29,17 +30,14 @@ impl KeyboardSource for WindowsKeyboardSource {
 
         let thread = InputThread::spawn(event_tx, init_tx);
 
-        let keyboards = match init_rx.await {
-            Ok(Ok(keyboards)) => keyboards,
-
+        let keyboards: Vec<Arc<Keyboard>> = match init_rx.await {
+            Ok(Ok(keyboards)) => keyboards.into_iter().map(Arc::new).collect(),
             Ok(Err(error)) => {
                 drop(thread);
                 return Err(error);
             }
-
             Err(_) => {
                 drop(thread);
-
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "Windows keyboard input thread exited during initialization",
@@ -56,7 +54,10 @@ impl KeyboardSource for WindowsKeyboardSource {
     }
 
     fn get_keyboards(&self) -> Vec<Keyboard> {
-        self.keyboards.clone()
+        self.keyboards
+            .iter()
+            .map(|keyboard| keyboard.as_ref().clone())
+            .collect()
     }
 
     async fn receive_event(&mut self) -> io::Result<KeyboardEvent> {
@@ -78,16 +79,14 @@ impl WindowsKeyboardSource {
         match event {
             KeyboardEvent::Plugged(keyboard) => {
                 if !self.keyboards.contains(keyboard) {
-                    self.keyboards.push(keyboard.clone());
+                    self.keyboards.push(Arc::clone(keyboard));
                 }
             }
-
             KeyboardEvent::Unplugged(keyboard) => {
                 self.keyboards.retain(|current| {
                     current.port_id.physical_path != keyboard.port_id.physical_path
                 });
             }
-
             KeyboardEvent::Pressed(_) => {}
         }
     }

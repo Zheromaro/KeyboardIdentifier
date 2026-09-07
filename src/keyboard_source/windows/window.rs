@@ -1,11 +1,11 @@
 use super::enumerator::{DeviceEnumerator, DiscoveredKeyboard};
 use super::handles::DeviceHandle;
-use super::keyboard_state::KeyboardState;
 use super::raw_input::RawInput;
-use crate::keyboard_source::KeyboardEvent;
+use crate::keyboard_source::{Keyboard, KeyboardEvent};
 use std::ffi::c_void;
 use std::io;
 use std::ptr::null_mut;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
@@ -26,7 +26,7 @@ const WINDOW_CLASS_NAME: windows::core::PCWSTR = w!("KeyboardIdentifierRawInputW
 
 pub(crate) struct WindowState {
     sender: mpsc::UnboundedSender<KeyboardEvent>,
-    keyboards: KeyboardState,
+    keyboards: Vec<(DeviceHandle, Arc<Keyboard>)>,
 }
 
 impl WindowState {
@@ -34,17 +34,36 @@ impl WindowState {
         sender: mpsc::UnboundedSender<KeyboardEvent>,
         keyboards: Vec<DiscoveredKeyboard>,
     ) -> Self {
-        let keyboards = KeyboardState::new(
-            keyboards
-                .into_iter()
-                .map(|device| (device.handle, device.keyboard)),
-        );
+        let keyboards = keyboards
+            .into_iter()
+            .map(|device| (device.handle, Arc::new(device.keyboard)))
+            .collect();
 
         Self { sender, keyboards }
     }
 
     fn emit(&self, event: KeyboardEvent) {
         let _ = self.sender.send(event);
+    }
+
+    fn is_known_device(&self, device: &DeviceHandle) -> bool {
+        self.keyboards.iter().any(|(current, _)| current == device)
+    }
+
+    fn existing_keyboard(&self, device: &DeviceHandle) -> Option<Arc<Keyboard>> {
+        self.keyboards
+            .iter()
+            .find(|(current, _)| current == device)
+            .map(|(_, keyboard)| Arc::clone(keyboard))
+    }
+
+    fn remove_keyboard(&mut self, device: &DeviceHandle) -> Option<Arc<Keyboard>> {
+        let index = self
+            .keyboards
+            .iter()
+            .position(|(current, _)| current == device)?;
+
+        Some(self.keyboards.remove(index).1)
     }
 
     fn handle_device_change(&mut self, action: u32, handle: HANDLE) {
@@ -62,15 +81,18 @@ impl WindowState {
             return;
         };
 
-        let was_new = self.keyboards.insert(device, keyboard.clone());
-
-        if was_new {
-            self.emit(KeyboardEvent::Plugged(keyboard));
+        if self.is_known_device(&device) {
+            return;
         }
+
+        let keyboard = Arc::new(keyboard);
+
+        self.keyboards.push((device, Arc::clone(&keyboard)));
+        self.emit(KeyboardEvent::Plugged(keyboard));
     }
 
     fn handle_removal(&mut self, device: DeviceHandle) {
-        if let Some(keyboard) = self.keyboards.remove(device) {
+        if let Some(keyboard) = self.remove_keyboard(&device) {
             self.emit(KeyboardEvent::Unplugged(keyboard));
         }
     }
@@ -87,16 +109,16 @@ impl WindowState {
         let handle = input.device();
         let device = DeviceHandle::from(handle);
 
-        let keyboard = match self.keyboards.get(device) {
-            Some(keyboard) => keyboard.clone(),
-
+        let keyboard = match self.existing_keyboard(&device) {
+            Some(keyboard) => keyboard,
             None => {
                 let Some(keyboard) = DeviceEnumerator::keyboard_from_handle(handle) else {
                     return;
                 };
 
-                self.keyboards.insert(device, keyboard.clone());
+                let keyboard = Arc::new(keyboard);
 
+                self.keyboards.push((device, Arc::clone(&keyboard)));
                 keyboard
             }
         };
@@ -138,7 +160,6 @@ impl MessageOnlyWindow {
 
         match result {
             Ok(hwnd) => Ok(Self { hwnd }),
-
             Err(error) => {
                 // SAFETY:
                 // CreateWindowExW failed, therefore ownership of
@@ -229,18 +250,14 @@ impl MessageOnlyWindow {
         match message {
             WM_NCCREATE => {
                 Self::attach_state(hwnd, lparam);
-
                 LRESULT(1)
             }
-
             WM_CLOSE => {
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
-
                 LRESULT(0)
             }
-
             WM_INPUT_DEVICE_CHANGE => {
                 Self::with_state(hwnd, |state| {
                     let handle = HANDLE(lparam.0 as *mut c_void);
@@ -249,7 +266,6 @@ impl MessageOnlyWindow {
 
                 LRESULT(0)
             }
-
             WM_INPUT => {
                 Self::with_state(hwnd, |state| {
                     state.handle_input(lparam);
@@ -257,7 +273,6 @@ impl MessageOnlyWindow {
 
                 LRESULT(0)
             }
-
             WM_NCDESTROY => {
                 Self::unregister_raw_input();
                 Self::detach_state(hwnd);
@@ -268,7 +283,6 @@ impl MessageOnlyWindow {
 
                 LRESULT(0)
             }
-
             _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
         }
     }
@@ -278,7 +292,6 @@ impl MessageOnlyWindow {
         // During WM_NCCREATE, lParam points to the CREATESTRUCTW
         // supplied by CreateWindowExW.
         let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-
         let state = create.lpCreateParams;
 
         unsafe {
