@@ -73,11 +73,20 @@ async fn test_listen_shuts_down_on_drop() {
 }
 
 #[tokio::test]
-async fn test_new_and_default() {
+async fn test_new() {
     // Verify new() initializes without panicking
     let _listener_new = KeyboardManager::new();
 
     // If we reach here without a panic, the internal broadcast channels
     // and registries were successfully created.
-    assert!(true);
+}
+
+#[tokio::test]
+async fn test_from() {
+    let computer = MockDeviceSource::new().await.unwrap();
+    // Verify from() initializes without panicking
+    let _listener_new = KeyboardManager::from(computer);
+
+    // If we reach here without a panic, the internal broadcast channels
+    // and registries were successfully created.
 }

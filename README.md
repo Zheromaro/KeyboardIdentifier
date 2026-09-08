@@ -25,8 +25,9 @@ tokio = { version = "1", features = ["full"] }
 
 This example demonstrates how to list available keyboards, ask the user to press a key to "select" a specific keyboard, and then monitor events specifically for that device.
 
-```rust
-use keyboard_identifier::{KeyboardEvent, KeyboardManager};
+```rust,no_run
+use keyboard_identifier::{KeyboardManager, keyboard_source::*};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -49,13 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let tx_pressed = tx.clone();
-    manager.on_pressed(move |kb| { let _ = tx_pressed.send(KeyboardEvent::Pressed(kb.clone())); });
+    manager.on_pressed(move |kb| { let _ = tx_pressed.send(KeyboardEvent::Pressed(Arc::new(kb.clone()))); });
 
     let tx_plugged = tx.clone();
-    manager.on_plugged(move |kb| { let _ = tx_plugged.send(KeyboardEvent::Plugged(kb.clone())); });
+    manager.on_plugged(move |kb| { let _ = tx_plugged.send(KeyboardEvent::Plugged(Arc::new(kb.clone()))); });
 
     let tx_unplugged = tx.clone();
-    manager.on_unplugged(move |kb| { let _ = tx_unplugged.send(KeyboardEvent::Unplugged(kb.clone())); });
+    manager.on_unplugged(move |kb| { let _ = tx_unplugged.send(KeyboardEvent::Unplugged(Arc::new(kb.clone()))); });
 
     // Start background listening
     manager.listen().await;

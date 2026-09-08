@@ -86,7 +86,7 @@ impl KeyboardSource for MockDeviceSource {
             .await
             .recv()
             .await
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "channel closed"))
+            .ok_or_else(|| std::io::Error::other("channel closed"))
     }
 }
 

@@ -1,17 +1,29 @@
-#[cfg(all(target_os = "linux"))]
+//! Core types and traits for keyboard event sourcing.
+//!
+//! This module defines the data structures representing keyboards and their
+//! events, as well as the [`KeyboardSource`] trait that abstracts OS-specific
+//! input handling.
+
+#[cfg(target_os = "linux")]
 mod linux;
-#[cfg(all(target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub use linux::LinuxKeyboardSource as NativeKeyboardSource;
 
-#[cfg(all(target_os = "windows"))]
+#[cfg(target_os = "windows")]
 mod windows;
-#[cfg(all(target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub use windows::WindowsKeyboardSource as NativeKeyboardSource;
 
-use std::{fmt, io, sync::Arc};
+use std::{fmt, future::Future, io, sync::Arc};
 
+/// Represents the physical port or connection path of a keyboard.
+///
+/// This is useful for differentiating between multiple identical keyboards
+/// (same Vendor ID, Product ID, and Name) plugged into different USB ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortID {
+    /// The physical path of the port (e.g., USB topology path).
+    /// May be `None` if the underlying OS does not provide this information.
     pub physical_path: Option<String>,
 }
 
@@ -25,11 +37,19 @@ impl fmt::Display for PortID {
     }
 }
 
+/// Represents the hardware identification details of a keyboard.
+///
+/// Contains standard USB/HID identifiers such as Vendor ID, Product ID,
+/// Serial Number, and the human-readable device Name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardID {
+    /// The human-readable name of the keyboard.
     pub name: Option<String>,
+    /// The Vendor ID (VID) of the keyboard.
     pub vendor_id: Option<String>,
+    /// The Product ID (PID) of the keyboard.
     pub product_id: Option<String>,
+    /// The serial number of the keyboard, if available.
     pub serial: Option<String>,
 }
 
@@ -46,9 +66,13 @@ impl fmt::Display for KeyboardID {
     }
 }
 
+/// Represents a connected keyboard device, combining its hardware identity
+/// and physical connection port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keyboard {
+    /// The hardware identification details of the keyboard.
     pub keyboard_id: KeyboardID,
+    /// The physical port information of the keyboard.
     pub port_id: PortID,
 }
 
@@ -62,10 +86,14 @@ impl fmt::Display for Keyboard {
     }
 }
 
+/// Represents an event related to a keyboard device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardEvent {
+    /// A keyboard was plugged into the system.
     Plugged(Arc<Keyboard>),
+    /// A keyboard was unplugged from the system.
     Unplugged(Arc<Keyboard>),
+    /// A key was pressed on the keyboard.
     Pressed(Arc<Keyboard>),
 }
 
@@ -79,9 +107,26 @@ impl fmt::Display for KeyboardEvent {
     }
 }
 
+/// A trait for abstracting OS-specific keyboard event sources.
+///
+/// Implementors of this trait handle the low-level details of enumerating
+/// keyboards and receiving input events for a specific operating system.
 pub trait KeyboardSource: Sized {
+    /// Creates a new instance of the keyboard source.
+    ///
+    /// This is an asynchronous operation as it may require initializing
+    /// OS-specific handles, threads, or device listeners.
     fn new() -> impl Future<Output = io::Result<Self>> + Send;
+
+    /// Returns a list of currently connected keyboards.
     fn get_keyboards(&self) -> Vec<Keyboard>;
+
+    /// Asynchronously waits for and returns the next keyboard event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the underlying OS event source fails,
+    /// encounters a permissions issue, or is disconnected.
     fn receive_event(
         &mut self,
     ) -> impl Future<Output = Result<KeyboardEvent, std::io::Error>> + Send;

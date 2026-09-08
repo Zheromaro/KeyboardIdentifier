@@ -6,6 +6,16 @@ use tracing::{error, warn};
 
 type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
 
+/// The main manager for tracking keyboards and listening to their events.
+///
+/// `KeyboardManager` maintains a list of active keyboards and allows you to
+/// register callbacks for specific events: key presses, device plugged,
+/// and device unplugged.
+///
+/// # Type Parameters
+///
+/// * `P`: The underlying [`KeyboardSource`] implementation. Defaults to
+///   the OS-native source (`NativeKeyboardSource`).
 pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
     provider: Option<P>,
     active_keyboards: Arc<RwLock<Vec<Keyboard>>>,
@@ -16,6 +26,10 @@ pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
 }
 
 impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
+    /// Returns a list of currently active keyboards.
+    ///
+    /// If the provider is still available, it will query the provider directly
+    /// and update the internal cache. Otherwise, it returns the last cached list.
     pub fn get_keyboards(&self) -> Vec<Keyboard> {
         match self.provider.as_ref() {
             Some(p) => {
@@ -31,6 +45,10 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         }
     }
 
+    /// Registers a callback to be executed when a keyboard is plugged in.
+    ///
+    /// Multiple callbacks can be registered. They will be executed sequentially
+    /// when a `Plugged` event is received.
     pub fn on_plugged<F>(&self, callback: F)
     where
         F: Fn(&Keyboard) + Send + Sync + 'static,
@@ -38,6 +56,10 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         self.on_plugged.register(Arc::new(callback));
     }
 
+    /// Registers a callback to be executed when a keyboard is unplugged.
+    ///
+    /// Multiple callbacks can be registered. They will be executed sequentially
+    /// when an `Unplugged` event is received.
     pub fn on_unplugged<F>(&self, callback: F)
     where
         F: Fn(&Keyboard) + Send + Sync + 'static,
@@ -45,6 +67,10 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         self.on_unplugged.register(Arc::new(callback));
     }
 
+    /// Registers a callback to be executed when a key is pressed on any tracked keyboard.
+    ///
+    /// Multiple callbacks can be registered. They will be executed sequentially
+    /// when a `Pressed` event is received.
     pub fn on_pressed<F>(&self, callback: F)
     where
         F: Fn(&Keyboard) + Send + Sync + 'static,
@@ -52,6 +78,17 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         self.on_pressed.register(Arc::new(callback));
     }
 
+    /// Starts the background event listening loop.
+    ///
+    /// This method spawns a Tokio task that continuously polls the underlying
+    /// [`KeyboardSource`] for events. It will route events to the registered
+    /// callbacks and maintain the internal list of active keyboards.
+    ///
+    /// # Note
+    ///
+    /// This method can only be called once. Subsequent calls will log a warning
+    /// and return immediately. The loop will automatically terminate when the
+    /// `KeyboardManager` is dropped.
     pub async fn listen(&mut self) {
         let Some(mut provider) = self.provider.take() else {
             warn!("listen() can only be called once");
@@ -108,6 +145,12 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
 }
 
 impl KeyboardManager {
+    /// Creates a new `KeyboardManager` using the default OS-native keyboard source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `io::Error` if the underlying OS-specific keyboard source
+    /// fails to initialize (e.g., due to permissions or missing system APIs).
     pub async fn new() -> std::io::Result<Self> {
         let provider = NativeKeyboardSource::new().await?;
         let initial_keyboards = provider.get_keyboards();
@@ -125,6 +168,10 @@ impl KeyboardManager {
 }
 
 impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
+    /// Creates a new `KeyboardManager` from a custom [`KeyboardSource`] provider.
+    ///
+    /// This is useful for integration testing or for providing a custom,
+    /// mocked event source implementation.
     fn from(provider: P) -> Self {
         let initial_keyboards = provider.get_keyboards();
         let (shutdown, _) = broadcast::channel(1);
@@ -142,6 +189,7 @@ impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
 
 impl<P: KeyboardSource> Drop for KeyboardManager<P> {
     fn drop(&mut self) {
+        // Signal the background task to shut down gracefully
         let _ = self.shutdown.send(());
     }
 }
