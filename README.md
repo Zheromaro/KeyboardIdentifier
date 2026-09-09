@@ -18,7 +18,7 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 keyboard_identifier = "0.1.0" # replace with your actual version
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "rt-multi-thread"] }
 ```
 
 ## Example Usage
@@ -113,4 +113,4 @@ An enum representing what happened to a keyboard:
 
 ## License
 
-This project is licensed under [MIT] - see the LICENSE file for details.
+This project is licensed under \[MIT\] - see the LICENSE file for details.
