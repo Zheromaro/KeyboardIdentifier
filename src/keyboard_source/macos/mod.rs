@@ -24,18 +24,29 @@ pub struct MacosKeyboardSource {
 }
 
 impl KeyboardSource for MacosKeyboardSource {
+    use tokio::sync::oneshot;
+
     async fn new() -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel(128);
         let (shutdown, _) = broadcast::channel(1);
         let shutdown_rx = shutdown.subscribe();
-        let sender_clone = sender.clone();
+        let (init_tx, init_rx) = oneshot::channel();
 
         std::thread::spawn(move || {
-            if let Err(error) = macos_hid_loop(sender_clone, shutdown_rx) {
+            if let Err(error) = macos_hid_loop(sender, shutdown_rx) {
+                init_tx.send(Err(err));
                 error!(error = %error, "macOS HID loop terminated unexpectedly");
             }
         });
-        Ok(Self { receiver, shutdown })
+
+        match init_rx.await {
+            Ok(Ok(())) => Ok(Self { receiver, shutdown }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "macOS initialization thread died unexpectedly",
+            )),
+        }
     }
 
     async fn receive_event(&mut self) -> Result<KeyboardEvent, io::Error> {
