@@ -1,99 +1,108 @@
-use super::enumerator::{DeviceEnumerator, DiscoveredKeyboard};
-use super::handles::DeviceHandle;
-use super::raw_input::RawInput;
+use super::device::{DeviceEnumerator, DeviceHandle, DiscoveredKeyboard, RawInput};
 use crate::keyboard_source::{Keyboard, KeyboardEvent};
-use std::ffi::c_void;
-use std::io;
-use std::ptr::null_mut;
-use std::sync::Arc;
+use std::{
+    ffi::c_void,
+    io,
+    ptr::null_mut,
+    sync::{
+        Arc,
+        atomic::{AtomicIsize, Ordering},
+    },
+};
 use tokio::sync::mpsc;
-use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
-};
-use windows::Win32::UI::Input::{
-    RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GIDC_ARRIVAL, GIDC_REMOVAL, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, MSG,
-    PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_CLOSE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_NCCREATE, WM_NCDESTROY,
-    WNDCLASSEXW,
+use windows::Win32::{
+    Foundation::{
+        ERROR_CLASS_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    },
+    UI::{
+        Input::{
+            RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
+        },
+        WindowsAndMessaging::{
+            CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
+            DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GWLP_USERDATA, GetMessageW,
+            GetWindowLongPtrW, HWND_MESSAGE, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+            SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_INPUT,
+            WM_INPUT_DEVICE_CHANGE, WM_NCCREATE, WM_NCDESTROY, WNDCLASSEXW,
+        },
+    },
 };
 use windows::core::w;
 
 const WINDOW_CLASS_NAME: windows::core::PCWSTR = w!("KeyboardIdentifierRawInputWindow");
 
+#[derive(Debug)]
+pub(crate) struct WindowHandleSlot {
+    value: AtomicIsize,
+}
+
+impl WindowHandleSlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            value: AtomicIsize::new(0),
+        }
+    }
+
+    pub(crate) fn store(&self, hwnd: HWND) {
+        self.value.store(hwnd.0 as isize, Ordering::Release);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.value.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn close(&self) {
+        let value = self.value.load(Ordering::Acquire);
+        if value != 0 {
+            unsafe {
+                let _ = PostMessageW(HWND(value as *mut c_void), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
 pub(crate) struct WindowState {
-    sender: mpsc::UnboundedSender<KeyboardEvent>,
+    sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     keyboards: Vec<(DeviceHandle, Arc<Keyboard>)>,
 }
 
 impl WindowState {
     pub(crate) fn new(
-        sender: mpsc::UnboundedSender<KeyboardEvent>,
+        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
         keyboards: Vec<DiscoveredKeyboard>,
     ) -> Self {
-        let keyboards = keyboards
-            .into_iter()
-            .map(|device| (device.handle, Arc::new(device.keyboard)))
-            .collect();
-
-        Self { sender, keyboards }
-    }
-
-    fn emit(&self, event: KeyboardEvent) {
-        let _ = self.sender.send(event);
-    }
-
-    fn is_known_device(&self, device: &DeviceHandle) -> bool {
-        self.keyboards.iter().any(|(current, _)| current == device)
-    }
-
-    fn existing_keyboard(&self, device: &DeviceHandle) -> Option<Arc<Keyboard>> {
-        self.keyboards
-            .iter()
-            .find(|(current, _)| current == device)
-            .map(|(_, keyboard)| Arc::clone(keyboard))
-    }
-
-    fn remove_keyboard(&mut self, device: &DeviceHandle) -> Option<Arc<Keyboard>> {
-        let index = self
-            .keyboards
-            .iter()
-            .position(|(current, _)| current == device)?;
-
-        Some(self.keyboards.remove(index).1)
+        Self {
+            sender,
+            keyboards: keyboards
+                .into_iter()
+                .map(|d| (d.handle, Arc::new(d.keyboard)))
+                .collect(),
+        }
     }
 
     fn handle_device_change(&mut self, action: u32, handle: HANDLE) {
         let device = DeviceHandle::from(handle);
-
         match action {
-            GIDC_ARRIVAL => self.handle_arrival(device, handle),
-            GIDC_REMOVAL => self.handle_removal(device),
+            GIDC_ARRIVAL => {
+                if !self.keyboards.iter().any(|(c, _)| c == &device) {
+                    if let Some(keyboard) = DeviceEnumerator::keyboard_from_handle(handle) {
+                        let keyboard = Arc::new(keyboard);
+                        self.keyboards.push((device, Arc::clone(&keyboard)));
+                        let _ = self
+                            .sender
+                            .blocking_send(Ok(KeyboardEvent::Plugged(keyboard)));
+                    }
+                }
+            }
+            GIDC_REMOVAL => {
+                if let Some(index) = self.keyboards.iter().position(|(c, _)| c == &device) {
+                    let keyboard = self.keyboards.remove(index).1;
+                    let _ = self
+                        .sender
+                        .blocking_send(Ok(KeyboardEvent::Unplugged(keyboard)));
+                }
+            }
             _ => {}
-        }
-    }
-
-    fn handle_arrival(&mut self, device: DeviceHandle, handle: HANDLE) {
-        let Some(keyboard) = DeviceEnumerator::keyboard_from_handle(handle) else {
-            return;
-        };
-
-        if self.is_known_device(&device) {
-            return;
-        }
-
-        let keyboard = Arc::new(keyboard);
-
-        self.keyboards.push((device, Arc::clone(&keyboard)));
-        self.emit(KeyboardEvent::Plugged(keyboard));
-    }
-
-    fn handle_removal(&mut self, device: DeviceHandle) {
-        if let Some(keyboard) = self.remove_keyboard(&device) {
-            self.emit(KeyboardEvent::Unplugged(keyboard));
         }
     }
 
@@ -101,29 +110,36 @@ impl WindowState {
         let Ok(input) = RawInput::from_message(lparam) else {
             return;
         };
-
         if !input.is_keyboard() || !input.is_key_down() {
             return;
         }
-
         let handle = input.device();
         let device = DeviceHandle::from(handle);
 
-        let keyboard = match self.existing_keyboard(&device) {
-            Some(keyboard) => keyboard,
+        let keyboard = match self
+            .keyboards
+            .iter()
+            .find(|(c, _)| c == &device)
+            .map(|(_, k)| Arc::clone(k))
+        {
+            Some(k) => k,
             None => {
-                let Some(keyboard) = DeviceEnumerator::keyboard_from_handle(handle) else {
+                // Device not in cache — attempt to query it. If the device has
+                // already been unplugged or cannot be queried, silently drop
+                // this input event instead of panicking.
+                if let Some(k) = DeviceEnumerator::keyboard_from_handle(handle) {
+                    let k = Arc::new(k);
+                    self.keyboards.push((device, Arc::clone(&k)));
+                    k
+                } else {
                     return;
-                };
-
-                let keyboard = Arc::new(keyboard);
-
-                self.keyboards.push((device, Arc::clone(&keyboard)));
-                keyboard
+                }
             }
         };
 
-        self.emit(KeyboardEvent::Pressed(keyboard));
+        let _ = self
+            .sender
+            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard)));
     }
 }
 
@@ -136,12 +152,21 @@ impl MessageOnlyWindow {
         instance: HINSTANCE,
         state: WindowState,
     ) -> Result<Self, windows::core::Error> {
-        Self::register_class(instance)?;
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(Self::wnd_proc),
+            hInstance: instance,
+            lpszClassName: WINDOW_CLASS_NAME,
+            ..Default::default()
+        };
+        if unsafe { RegisterClassExW(&class) } == 0
+            && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
+        {
+            return Err(windows::core::Error::from_win32());
+        }
 
-        let state = Box::new(state);
-        let state_ptr = Box::into_raw(state);
-
-        let result = unsafe {
+        let state_ptr = Box::into_raw(Box::new(state));
+        match unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 WINDOW_CLASS_NAME,
@@ -156,25 +181,25 @@ impl MessageOnlyWindow {
                 instance,
                 Some(state_ptr.cast::<c_void>()),
             )
-        };
-
-        match result {
+        } {
             Ok(hwnd) => Ok(Self { hwnd }),
-            Err(error) => {
-                // SAFETY:
-                // CreateWindowExW failed, therefore ownership of
-                // `state_ptr` was never transferred to the window.
+            Err(e) => {
                 unsafe {
                     drop(Box::from_raw(state_ptr));
                 }
-
-                Err(error)
+                Err(e)
             }
         }
     }
 
     pub(crate) fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    pub(crate) fn destroy(&self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
     }
 
     pub(crate) fn register_raw_input(&self) -> io::Result<()> {
@@ -184,7 +209,6 @@ impl MessageOnlyWindow {
             dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
             hwndTarget: self.hwnd,
         };
-
         unsafe {
             RegisterRawInputDevices(
                 std::slice::from_ref(&device),
@@ -195,15 +219,8 @@ impl MessageOnlyWindow {
     }
 
     pub(crate) fn run_message_loop(&self) {
-        loop {
-            let mut message = MSG::default();
-
-            let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-
-            if result.0 == -1 || result.0 == 0 {
-                break;
-            }
-
+        let mut message = MSG::default();
+        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
             unsafe {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -211,45 +228,18 @@ impl MessageOnlyWindow {
         }
     }
 
-    pub(crate) fn destroy(&self) {
-        unsafe {
-            let _ = DestroyWindow(self.hwnd);
-        }
-    }
-
-    fn register_class(instance: HINSTANCE) -> Result<(), windows::core::Error> {
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(Self::wnd_proc),
-            hInstance: instance,
-            lpszClassName: WINDOW_CLASS_NAME,
-            ..Default::default()
-        };
-
-        let result = unsafe { RegisterClassExW(&class) };
-
-        if result != 0 {
-            return Ok(());
-        }
-
-        let error = unsafe { GetLastError() };
-
-        if error == ERROR_CLASS_ALREADY_EXISTS {
-            Ok(())
-        } else {
-            Err(windows::core::Error::from_win32())
-        }
-    }
-
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
-        message: u32,
+        msg: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        match message {
+        match msg {
             WM_NCCREATE => {
-                Self::attach_state(hwnd, lparam);
+                unsafe {
+                    let state = (*(lparam.0 as *const CREATESTRUCTW)).lpCreateParams;
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+                }
                 LRESULT(1)
             }
             WM_CLOSE => {
@@ -259,93 +249,43 @@ impl MessageOnlyWindow {
                 LRESULT(0)
             }
             WM_INPUT_DEVICE_CHANGE => {
-                Self::with_state(hwnd, |state| {
-                    let handle = HANDLE(lparam.0 as *mut c_void);
-                    state.handle_device_change(wparam.0 as u32, handle);
-                });
-
+                if let Some(state) =
+                    unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState).as_mut() }
+                {
+                    state.handle_device_change(wparam.0 as u32, HANDLE(lparam.0 as *mut c_void));
+                }
                 LRESULT(0)
             }
             WM_INPUT => {
-                Self::with_state(hwnd, |state| {
+                if let Some(state) =
+                    unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState).as_mut() }
+                {
                     state.handle_input(lparam);
-                });
-
+                }
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                Self::unregister_raw_input();
-                Self::detach_state(hwnd);
-
                 unsafe {
+                    let device = RAWINPUTDEVICE {
+                        usUsagePage: 0x01,
+                        usUsage: 0x06,
+                        dwFlags: RIDEV_REMOVE,
+                        hwndTarget: HWND(null_mut()),
+                    };
+                    let _ = RegisterRawInputDevices(
+                        std::slice::from_ref(&device),
+                        std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+                    );
+                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    if !ptr.is_null() {
+                        drop(Box::from_raw(ptr));
+                    }
                     PostQuitMessage(0);
                 }
-
                 LRESULT(0)
             }
-            _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
-        }
-    }
-
-    fn attach_state(hwnd: HWND, lparam: LPARAM) {
-        // SAFETY:
-        // During WM_NCCREATE, lParam points to the CREATESTRUCTW
-        // supplied by CreateWindowExW.
-        let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-        let state = create.lpCreateParams;
-
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-        }
-    }
-
-    fn with_state(hwnd: HWND, callback: impl FnOnce(&mut WindowState)) {
-        let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState };
-
-        if state_ptr.is_null() {
-            return;
-        }
-
-        // SAFETY:
-        // The pointer was created by Box::into_raw during window creation
-        // and remains valid until WM_NCDESTROY.
-        let state = unsafe { &mut *state_ptr };
-
-        callback(state);
-    }
-
-    fn detach_state(hwnd: HWND) {
-        let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState };
-
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        }
-
-        if state_ptr.is_null() {
-            return;
-        }
-
-        // SAFETY:
-        // Ownership was transferred to the window through Box::into_raw.
-        // WM_NCDESTROY is the single point where the allocation is reclaimed.
-        unsafe {
-            drop(Box::from_raw(state_ptr));
-        }
-    }
-
-    fn unregister_raw_input() {
-        let device = RAWINPUTDEVICE {
-            usUsagePage: 0x01,
-            usUsage: 0x06,
-            dwFlags: RIDEV_REMOVE,
-            hwndTarget: HWND(null_mut()),
-        };
-
-        unsafe {
-            let _ = RegisterRawInputDevices(
-                std::slice::from_ref(&device),
-                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-            );
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
         }
     }
 }
