@@ -3,7 +3,7 @@ name = "keyboard_identifier"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
-description = "Async keyboard enumeration and hotplug events for Linux and Windows"
+description = "Async keyboard enumeration and hotplug events for Linux, Windows, and macOS"
 license = "MIT"
 repository = "https://github.com/Zheromaro/KeyboardIdentifier"
 homepage = "https://github.com/Zheromaro/KeyboardIdentifier"
@@ -39,3 +39,5 @@ windows = { version = "0.58", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
 ]}
+
+[target.'cfg(target_os = "macos")'.dependencies]

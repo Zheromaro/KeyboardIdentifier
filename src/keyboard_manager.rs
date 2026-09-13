@@ -33,7 +33,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
     pub fn get_keyboards(&self) -> Vec<Keyboard> {
         match self.provider.as_ref() {
             Some(p) => {
-                let keyboards = p.get_keyboards();
+                let keyboards = p.enumerate_keyboards();
 
                 if let Ok(mut active_keyboards) = self.active_keyboards.write() {
                     *active_keyboards = keyboards.clone();
@@ -153,7 +153,7 @@ impl KeyboardManager {
     /// fails to initialize (e.g., due to permissions or missing system APIs).
     pub async fn new() -> std::io::Result<Self> {
         let provider = NativeKeyboardSource::new().await?;
-        let initial_keyboards = provider.get_keyboards();
+        let initial_keyboards = provider.enumerate_keyboards();
         let (shutdown, _) = broadcast::channel(1);
 
         Ok(Self {
@@ -173,7 +173,7 @@ impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
     /// This is useful for integration testing or for providing a custom,
     /// mocked event source implementation.
     fn from(provider: P) -> Self {
-        let initial_keyboards = provider.get_keyboards();
+        let initial_keyboards = provider.enumerate_keyboards();
         let (shutdown, _) = broadcast::channel(1);
 
         Self {

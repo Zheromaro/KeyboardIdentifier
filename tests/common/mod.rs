@@ -71,7 +71,7 @@ impl KeyboardSource for MockDeviceSource {
         })
     }
 
-    fn get_keyboards(&self) -> Vec<Keyboard> {
+    fn enumerate_keyboards(&self) -> Vec<Keyboard> {
         self.devices
             .lock()
             .unwrap()

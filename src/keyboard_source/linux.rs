@@ -40,7 +40,7 @@ impl KeyboardSource for LinuxKeyboardSource {
         }
     }
 
-    fn get_keyboards(&self) -> Vec<Keyboard> {
+    fn enumerate_keyboards(&self) -> Vec<Keyboard> {
         match enumerate_keyboards() {
             Ok(keyboards) => keyboards
                 .into_iter()

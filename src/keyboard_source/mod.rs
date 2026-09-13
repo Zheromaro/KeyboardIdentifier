@@ -14,6 +14,11 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsKeyboardSource as NativeKeyboardSource;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::MacosKeyboardSource as NativeKeyboardSource;
+
 use std::{fmt, future::Future, io, sync::Arc};
 
 /// Represents the physical port or connection path of a keyboard.
@@ -119,7 +124,7 @@ pub trait KeyboardSource: Sized {
     fn new() -> impl Future<Output = io::Result<Self>> + Send;
 
     /// Returns a list of currently connected keyboards.
-    fn get_keyboards(&self) -> Vec<Keyboard>;
+    fn enumerate_keyboards(&self) -> Vec<Keyboard>;
 
     /// Asynchronously waits for and returns the next keyboard event.
     ///
