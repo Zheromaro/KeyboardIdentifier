@@ -96,5 +96,6 @@ unsafe extern "C" {
     pub fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) -> CFTypeRef;
     pub fn IOHIDValueGetIntegerValue(value: IOHIDValueRef) -> isize;
     pub fn IOHIDValueGetElement(value: IOHIDValueRef) -> IOHIDElementRef;
+    pub fn IOHIDElementGetUsage(element: IOHIDElementRef) -> u32;
     pub fn IOHIDElementGetDevice(element: IOHIDElementRef) -> IOHIDDeviceRef;
 }

@@ -16,6 +16,7 @@ categories = ["hardware-support", "os::linux-apis", "os::windows-apis"]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc"]
 
 [dependencies]
+keyboard-types = "0.8.3"
 tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "rt-multi-thread"] }
 tracing = "0.1"
 

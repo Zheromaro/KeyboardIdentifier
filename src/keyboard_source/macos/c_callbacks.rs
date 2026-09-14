@@ -1,6 +1,7 @@
 use super::ffi_declarations::*;
 use super::{HidContext, PRESSED, USAGE_KEYBOARD, USAGE_PAGE_GENERIC_DESKTOP, map_to_keyboard};
 use crate::keyboard_source::KeyboardEvent;
+use keyboard_types::Code;
 use std::{ffi::c_void, ptr, sync::Arc};
 use tracing::warn;
 
@@ -54,9 +55,18 @@ pub(super) extern "C" fn input_callback(
         let int_value = IOHIDValueGetIntegerValue(value);
         if int_value == PRESSED as isize {
             let element = IOHIDValueGetElement(value);
+            let usage = IOHIDElementGetUsage(element) as usize;
+            let code = MACOS_HID_MAP
+                .get(usage)
+                .copied()
+                .unwrap_or(Code::Unidentified);
+
             let device = IOHIDElementGetDevice(element);
             if let Some(kb) = ctx.keyboards.get(&(device as isize)) {
-                if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Pressed(kb.clone()))) {
+                if let Err(e) = ctx
+                    .sender
+                    .try_send(Ok(KeyboardEvent::Pressed(kb.clone(), code)))
+                {
                     warn!(error = %e, "Dropped Pressed event: channel full");
                 }
             }

@@ -1,5 +1,8 @@
+mod key_mapping;
 use super::{Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID};
-use evdev::Device as EvdevDevice;
+use evdev::{Device as EvdevDevice, KeyCode};
+use key_mapping::*;
+use keyboard_types::{KeyboardEvent as KeyEvent, Modifiers};
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 use tokio::{
     io::unix::AsyncFd,
@@ -10,7 +13,6 @@ use tracing::error;
 use udev::{Device as UdevDevice, Enumerator, EventType, MonitorBuilder, MonitorSocket};
 
 const ENODEV: i32 = 19;
-const PRESSED: i32 = 1;
 
 pub struct LinuxKeyboardSource {
     receiver: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
@@ -48,7 +50,11 @@ impl KeyboardSource for LinuxKeyboardSource {
                 .collect(),
 
             Err(error) => {
-                error!(error = %error, "Failed to enumerate Linux keyboards");
+                error!(
+                    error = %error,
+                    "Failed to enumerate Linux keyboards"
+                );
+
                 Vec::new()
             }
         }
@@ -212,6 +218,8 @@ async fn evdev_loop(
         }
     };
 
+    let mut modifiers = Modifiers::empty();
+
     loop {
         let event = match stream.next_event().await {
             Ok(event) => event,
@@ -224,20 +232,71 @@ async fn evdev_loop(
                         "evdev error",
                     );
                 }
+
                 break;
             }
         };
 
-        if event.event_type() != evdev::EventType::KEY || event.value() != PRESSED {
+        if event.event_type() != evdev::EventType::KEY {
             continue;
         }
 
+        let key_code = evdev::KeyCode::new(event.code());
+
+        let Some((state, repeat)) = evdev_to_key_state(event.value()) else {
+            continue;
+        };
+
+        let modifier = modifier_for_key(key_code);
+
+        let is_lock_key = matches!(
+            key_code,
+            KeyCode::KEY_CAPSLOCK | KeyCode::KEY_NUMLOCK | KeyCode::KEY_SCROLLLOCK
+        );
+
+        let event_modifiers = match state {
+            keyboard_types::KeyState::Down => {
+                if let Some(modifier) = modifier {
+                    if is_lock_key && !repeat {
+                        modifiers.toggle(modifier); // Toggle only on initial press
+                    } else if !is_lock_key {
+                        modifiers.insert(modifier);
+                    }
+                }
+                modifiers
+            }
+            keyboard_types::KeyState::Up => {
+                if !is_lock_key {
+                    if let Some(modifier) = modifier {
+                        modifiers.remove(modifier);
+                    }
+                }
+                modifiers
+            }
+        };
+
+        let key_event = KeyEvent {
+            state,
+            key: evdev_to_key(key_code),
+            code: evdev_to_code(key_code),
+            location: evdev_to_location(key_code),
+            modifiers: event_modifiers,
+            repeat,
+            is_composing: false,
+        };
+
         if sender
-            .send(Ok(KeyboardEvent::Pressed(keyboard.clone())))
+            .send(Ok(KeyboardEvent::Pressed(keyboard.clone(), key_event)))
             .await
             .is_err()
         {
             break;
+        }
+
+        if state == keyboard_types::KeyState::Up {
+            if let Some(modifier) = modifier {
+                modifiers.remove(modifier);
+            }
         }
     }
 }
@@ -252,6 +311,7 @@ fn enumerate_keyboards() -> Result<Vec<(PathBuf, Arc<Keyboard>)>, io::Error> {
         .filter(|device| device.property_value("ID_INPUT_KEYBOARD").is_some())
         .filter_map(|device| {
             let devnode = device.devnode().map(PathBuf::from)?;
+
             let keyboard = Arc::new(map_to_keyboard(&device)?);
 
             Some((devnode, keyboard))

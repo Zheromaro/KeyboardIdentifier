@@ -19,6 +19,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacosKeyboardSource as NativeKeyboardSource;
 
+pub use keyboard_types::KeyboardEvent as KeyEvent;
 use std::{fmt, future::Future, io, sync::Arc};
 
 /// Represents the physical port or connection path of a keyboard.
@@ -27,8 +28,7 @@ use std::{fmt, future::Future, io, sync::Arc};
 /// (same Vendor ID, Product ID, and Name) plugged into different USB ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortID {
-    /// The physical path of the port (e.g., USB topology path).
-    /// May be `None` if the underlying OS does not provide this information.
+    /// The physical path of the port (e.g., USB topology path) if available.
     pub physical_path: Option<String>,
 }
 
@@ -43,16 +43,13 @@ impl fmt::Display for PortID {
 }
 
 /// Represents the hardware identification details of a keyboard.
-///
-/// Contains standard USB/HID identifiers such as Vendor ID, Product ID,
-/// Serial Number, and the human-readable device Name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardID {
-    /// The human-readable name of the keyboard.
+    /// The human-readable name of the keyboard if available.
     pub name: Option<String>,
-    /// The Vendor ID (VID) of the keyboard.
+    /// The Vendor ID (VID) of the keyboard if available.
     pub vendor_id: Option<String>,
-    /// The Product ID (PID) of the keyboard.
+    /// The Product ID (PID) of the keyboard if available.
     pub product_id: Option<String>,
     /// The serial number of the keyboard, if available.
     pub serial: Option<String>,
@@ -98,8 +95,9 @@ pub enum KeyboardEvent {
     Plugged(Arc<Keyboard>),
     /// A keyboard was unplugged from the system.
     Unplugged(Arc<Keyboard>),
-    /// A key was pressed on the keyboard.
-    Pressed(Arc<Keyboard>),
+    /// A key action (press or release) occurred on the keyboard.
+    /// KeyEvent for rich event data.
+    Pressed(Arc<Keyboard>, KeyEvent),
 }
 
 impl fmt::Display for KeyboardEvent {
@@ -107,7 +105,13 @@ impl fmt::Display for KeyboardEvent {
         match self {
             KeyboardEvent::Plugged(kb) => write!(f, "Plugged({})", kb),
             KeyboardEvent::Unplugged(kb) => write!(f, "Unplugged({})", kb),
-            KeyboardEvent::Pressed(kb) => write!(f, "Pressed({})", kb),
+            KeyboardEvent::Pressed(kb, event) => {
+                write!(
+                    f,
+                    "KeyAction({}, state={:?}, key={:?}, code={:?})",
+                    kb, event.state, event.key, event.code
+                )
+            }
         }
     }
 }

@@ -5,7 +5,7 @@ use super::{Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID};
 use c_callbacks::*;
 use ffi_declarations::*;
 use std::{collections::HashMap, ffi::c_void, io, ptr, sync::Arc};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::error; // Removed unused `warn`
 
 const PRESSED: i32 = 1;
@@ -24,8 +24,6 @@ pub struct MacosKeyboardSource {
 }
 
 impl KeyboardSource for MacosKeyboardSource {
-    use tokio::sync::oneshot;
-
     async fn new() -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel(128);
         let (shutdown, _) = broadcast::channel(1);
@@ -34,8 +32,10 @@ impl KeyboardSource for MacosKeyboardSource {
 
         std::thread::spawn(move || {
             if let Err(error) = macos_hid_loop(sender, shutdown_rx) {
-                init_tx.send(Err(err));
-                error!(error = %error, "macOS HID loop terminated unexpectedly");
+                let _ = init_tx.send(Err(error));
+                error!("macOS HID loop terminated unexpectedly");
+            } else {
+                let _ = init_tx.send(Ok(()));
             }
         });
 

@@ -1,15 +1,17 @@
-use crate::keyboard_source::*;
-use crate::registry::*;
+use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource, NativeKeyboardSource};
+use crate::registry::Registry;
+use keyboard_types::KeyboardEvent as KeyEvent;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 use tracing::{error, warn};
 
-type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
+type DeviceCallback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
+type PressedCallback = Arc<dyn Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static>;
 
 /// The main manager for tracking keyboards and listening to their events.
 ///
 /// `KeyboardManager` maintains a list of active keyboards and allows you to
-/// register callbacks for specific events: key presses, device plugged,
+/// register callbacks for specific events: key actions, device plugged,
 /// and device unplugged.
 ///
 /// # Type Parameters
@@ -19,26 +21,21 @@ type Callback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
 pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
     provider: Option<P>,
     active_keyboards: Arc<RwLock<Vec<Keyboard>>>,
-    on_pressed: Registry<Callback>,
-    on_plugged: Registry<Callback>,
-    on_unplugged: Registry<Callback>,
+    on_pressed: Registry<PressedCallback>,
+    on_plugged: Registry<DeviceCallback>,
+    on_unplugged: Registry<DeviceCallback>,
     shutdown: broadcast::Sender<()>,
 }
 
 impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
     /// Returns a list of currently active keyboards.
-    ///
-    /// If the provider is still available, it will query the provider directly
-    /// and update the internal cache. Otherwise, it returns the last cached list.
     pub fn get_keyboards(&self) -> Vec<Keyboard> {
         match self.provider.as_ref() {
             Some(p) => {
                 let keyboards = p.enumerate_keyboards();
-
                 if let Ok(mut active_keyboards) = self.active_keyboards.write() {
                     *active_keyboards = keyboards.clone();
                 }
-
                 keyboards
             }
             None => self.active_keyboards.read().unwrap().clone(),
@@ -67,13 +64,18 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         self.on_unplugged.register(Arc::new(callback));
     }
 
-    /// Registers a callback to be executed when a key is pressed on any tracked keyboard.
+    /// Registers a callback to be executed when any key action (press or release)
+    /// occurs on any tracked keyboard.
+    ///
     ///
     /// Multiple callbacks can be registered. They will be executed sequentially
     /// when a `Pressed` event is received.
+    ///
+    /// This provides the full [`keyboard_types::KeyboardEvent`], allowing access to
+    /// the logical key, physical code, modifiers, location, repeat state, and more.
     pub fn on_pressed<F>(&self, callback: F)
     where
-        F: Fn(&Keyboard) + Send + Sync + 'static,
+        F: Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static,
     {
         self.on_pressed.register(Arc::new(callback));
     }
@@ -105,9 +107,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
             loop {
                 let event = tokio::select! {
                     biased;
-
                     _ = shutdown.recv() => break,
-
                     res = provider.receive_event() => res,
                 };
 
@@ -118,22 +118,17 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
                         {
                             kbs.push((*kb).clone());
                         }
-
                         on_plugged.for_each(|cb| cb(&kb));
                     }
-
                     Ok(KeyboardEvent::Unplugged(kb)) => {
                         if let Ok(mut kbs) = active_keyboards.write() {
                             kbs.retain(|k| k != &*kb);
                         }
-
                         on_unplugged.for_each(|cb| cb(&kb));
                     }
-
-                    Ok(KeyboardEvent::Pressed(kb)) => {
-                        on_pressed.for_each(|cb| cb(&kb));
+                    Ok(KeyboardEvent::Pressed(kb, key_action)) => {
+                        on_pressed.for_each(|cb| cb(&kb, &key_action));
                     }
-
                     Err(e) => {
                         error!(error = %e, "keyboard source error");
                         break;
@@ -169,9 +164,6 @@ impl KeyboardManager {
 
 impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
     /// Creates a new `KeyboardManager` from a custom [`KeyboardSource`] provider.
-    ///
-    /// This is useful for integration testing or for providing a custom,
-    /// mocked event source implementation.
     fn from(provider: P) -> Self {
         let initial_keyboards = provider.enumerate_keyboards();
         let (shutdown, _) = broadcast::channel(1);
@@ -189,7 +181,6 @@ impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
 
 impl<P: KeyboardSource> Drop for KeyboardManager<P> {
     fn drop(&mut self) {
-        // Signal the background task to shut down gracefully
         let _ = self.shutdown.send(());
     }
 }

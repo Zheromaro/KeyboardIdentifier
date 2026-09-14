@@ -1,5 +1,6 @@
 use super::device::{DeviceEnumerator, DeviceHandle, DiscoveredKeyboard, RawInput};
 use crate::keyboard_source::{Keyboard, KeyboardEvent};
+use keyboard_types::Code;
 use std::{
     ffi::c_void,
     io,
@@ -124,9 +125,6 @@ impl WindowState {
         {
             Some(k) => k,
             None => {
-                // Device not in cache — attempt to query it. If the device has
-                // already been unplugged or cannot be queried, silently drop
-                // this input event instead of panicking.
                 if let Some(k) = DeviceEnumerator::keyboard_from_handle(handle) {
                     let k = Arc::new(k);
                     self.keyboards.push((device, Arc::clone(&k)));
@@ -137,9 +135,16 @@ impl WindowState {
             }
         };
 
+        let os_code = input.scancode() as usize;
+
+        let mapped_code = WINDOWS_SCANCODE_MAP
+            .get(os_code)
+            .copied()
+            .unwrap_or(Code::Unidentified);
+
         let _ = self
             .sender
-            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard)));
+            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard, mapped_code)));
     }
 }
 
