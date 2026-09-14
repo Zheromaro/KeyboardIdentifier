@@ -286,7 +286,7 @@ async fn evdev_loop(
         };
 
         if sender
-            .send(Ok(KeyboardEvent::Pressed(keyboard.clone(), key_event)))
+            .send(Ok(KeyboardEvent::KeyAction(keyboard.clone(), key_event)))
             .await
             .is_err()
         {

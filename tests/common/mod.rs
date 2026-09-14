@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 use keyboard_identifier::keyboard_source::{
-    Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID,
+    KeyEvent, Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID,
 };
+use keyboard_types::{Code, Key, KeyState};
 use std::time::Duration;
 use std::{
     io,
@@ -52,11 +53,37 @@ impl MockDeviceSource {
         }
     }
 
+    /// Simulates a key press (keydown) on the given keyboard.
     pub fn press(&self, keyboard: &Keyboard) {
+        self.press_key(keyboard, Key::Character("a".into()), Code::KeyA);
+    }
+
+    /// Simulates a key release (keyup) on the given keyboard.
+    pub fn release(&self, keyboard: &Keyboard) {
+        let mut event = key_event(Key::Character("a".into()), Code::KeyA);
+        event.state = KeyState::Up;
+        self.send_pressed(keyboard, event);
+    }
+
+    /// Simulates a key press with an explicit logical key and physical code.
+    pub fn press_key(&self, keyboard: &Keyboard, key: Key, code: Code) {
+        self.send_pressed(keyboard, key_event(key, code));
+    }
+
+    fn send_pressed(&self, keyboard: &Keyboard, event: KeyEvent) {
         let devices = self.devices.lock().unwrap();
         if let Some(dev) = devices.iter().find(|dev| ***dev == *keyboard) {
-            let _ = self.tx.send(KeyboardEvent::Pressed(dev.clone()));
+            let _ = self.tx.send(KeyboardEvent::KeyAction(dev.clone(), event));
         }
+    }
+}
+
+fn key_event(key: Key, code: Code) -> KeyEvent {
+    KeyEvent {
+        state: KeyState::Down,
+        key,
+        code,
+        ..Default::default()
     }
 }
 

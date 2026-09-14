@@ -1,7 +1,7 @@
 use keyboard_types::{Code, Key, Location, Modifiers, NamedKey};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
-pub fn raw_to_code(vkey: VIRTUAL_KEY, is_e0: bool) -> Code {
+pub fn raw_to_code(vkey: VIRTUAL_KEY, is_e0: bool, scancode: u16) -> Code {
     match vkey {
         VK_ESCAPE => Code::Escape,
 
@@ -62,8 +62,6 @@ pub fn raw_to_code(vkey: VIRTUAL_KEY, is_e0: bool) -> Code {
         VK_RMENU => Code::AltRight,
         VK_LWIN => Code::MetaLeft,
         VK_RWIN => Code::MetaRight,
-        VK_LSHIFT => Code::ShiftLeft,
-        VK_RSHIFT => Code::ShiftRight,
         VK_SHIFT => {
             if scancode == 0x36 {
                 Code::ShiftRight
@@ -173,9 +171,9 @@ pub fn raw_to_location(vkey: VIRTUAL_KEY, is_e0: bool) -> Location {
                 Location::Left
             }
         }
-        VK_NUMPAD0..=VK_NUMPAD9 | VK_MULTIPLY | VK_ADD | VK_SUBTRACT | VK_DECIMAL | VK_DIVIDE => {
-            Location::Numpad
-        }
+        VK_NUMPAD0 | VK_NUMPAD1 | VK_NUMPAD2 | VK_NUMPAD3 | VK_NUMPAD4 | VK_NUMPAD5
+        | VK_NUMPAD6 | VK_NUMPAD7 | VK_NUMPAD8 | VK_NUMPAD9 | VK_MULTIPLY | VK_ADD
+        | VK_SUBTRACT | VK_DECIMAL | VK_DIVIDE => Location::Numpad,
         VK_RETURN if is_e0 => Location::Numpad,
         _ => Location::Standard,
     }

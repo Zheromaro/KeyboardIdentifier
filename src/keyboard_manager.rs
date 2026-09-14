@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 use tracing::{error, warn};
 
 type DeviceCallback = Arc<dyn Fn(&Keyboard) + Send + Sync + 'static>;
-type PressedCallback = Arc<dyn Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static>;
+type KeyActionCallback = Arc<dyn Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static>;
 
 /// The main manager for tracking keyboards and listening to their events.
 ///
@@ -21,7 +21,7 @@ type PressedCallback = Arc<dyn Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static>
 pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
     provider: Option<P>,
     active_keyboards: Arc<RwLock<Vec<Keyboard>>>,
-    on_pressed: Registry<PressedCallback>,
+    on_key_action: Registry<KeyActionCallback>,
     on_plugged: Registry<DeviceCallback>,
     on_unplugged: Registry<DeviceCallback>,
     shutdown: broadcast::Sender<()>,
@@ -77,7 +77,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
     where
         F: Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static,
     {
-        self.on_pressed.register(Arc::new(callback));
+        self.on_key_action.register(Arc::new(callback));
     }
 
     /// Starts the background event listening loop.
@@ -97,7 +97,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
             return;
         };
 
-        let on_pressed = self.on_pressed.clone();
+        let on_pressed = self.on_key_action.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();
         let active_keyboards = self.active_keyboards.clone();
@@ -126,7 +126,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
                         }
                         on_unplugged.for_each(|cb| cb(&kb));
                     }
-                    Ok(KeyboardEvent::Pressed(kb, key_action)) => {
+                    Ok(KeyboardEvent::KeyAction(kb, key_action)) => {
                         on_pressed.for_each(|cb| cb(&kb, &key_action));
                     }
                     Err(e) => {
@@ -154,7 +154,7 @@ impl KeyboardManager {
         Ok(Self {
             provider: Some(provider),
             active_keyboards: Arc::new(RwLock::new(initial_keyboards)),
-            on_pressed: Registry::new(),
+            on_key_action: Registry::new(),
             on_plugged: Registry::new(),
             on_unplugged: Registry::new(),
             shutdown,
@@ -171,7 +171,7 @@ impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
         Self {
             provider: Some(provider),
             active_keyboards: Arc::new(RwLock::new(initial_keyboards)),
-            on_pressed: Registry::new(),
+            on_key_action: Registry::new(),
             on_plugged: Registry::new(),
             on_unplugged: Registry::new(),
             shutdown,

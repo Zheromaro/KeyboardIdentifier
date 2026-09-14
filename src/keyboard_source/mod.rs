@@ -97,7 +97,7 @@ pub enum KeyboardEvent {
     Unplugged(Arc<Keyboard>),
     /// A key action (press or release) occurred on the keyboard.
     /// KeyEvent for rich event data.
-    Pressed(Arc<Keyboard>, KeyEvent),
+    KeyAction(Arc<Keyboard>, KeyEvent),
 }
 
 impl fmt::Display for KeyboardEvent {
@@ -105,7 +105,7 @@ impl fmt::Display for KeyboardEvent {
         match self {
             KeyboardEvent::Plugged(kb) => write!(f, "Plugged({})", kb),
             KeyboardEvent::Unplugged(kb) => write!(f, "Unplugged({})", kb),
-            KeyboardEvent::Pressed(kb, event) => {
+            KeyboardEvent::KeyAction(kb, event) => {
                 write!(
                     f,
                     "KeyAction({}, state={:?}, key={:?}, code={:?})",
