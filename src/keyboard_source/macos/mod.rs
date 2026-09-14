@@ -1,14 +1,15 @@
 mod c_callbacks;
 mod ffi_declarations;
+mod key_mapping;
 
 use super::{Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID};
 use c_callbacks::*;
 use ffi_declarations::*;
+use keyboard_types::Modifiers;
 use std::{collections::HashMap, ffi::c_void, io, ptr, sync::Arc};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::error; // Removed unused `warn`
+use tracing::error;
 
-const PRESSED: i32 = 1;
 const USAGE_PAGE_GENERIC_DESKTOP: i32 = 1;
 const USAGE_KEYBOARD: i32 = 6;
 
@@ -16,6 +17,7 @@ const USAGE_KEYBOARD: i32 = 6;
 struct HidContext {
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     keyboards: HashMap<isize, Arc<Keyboard>>,
+    modifiers: HashMap<isize, Modifiers>,
 }
 
 pub struct MacosKeyboardSource {
@@ -77,6 +79,7 @@ impl Drop for MacosKeyboardSource {
 }
 
 // --- Core OS Integrations ---
+
 fn macos_hid_loop(
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     mut shutdown: broadcast::Receiver<()>,
@@ -97,6 +100,7 @@ fn macos_hid_loop(
         let context = Box::new(HidContext {
             sender,
             keyboards: HashMap::new(),
+            modifiers: HashMap::new(),
         });
         let context_ptr = Box::into_raw(context) as *mut c_void;
 
@@ -110,7 +114,6 @@ fn macos_hid_loop(
             b"kCFRunLoopDefaultMode\0".as_ptr() as _,
             0x08000100,
         );
-
         IOHIDManagerScheduleWithRunLoop(manager, run_loop, default_mode);
 
         if IOHIDManagerOpen(manager, 0) != 0 {
@@ -174,7 +177,6 @@ fn enumerate_macos_keyboards() -> Result<Vec<Keyboard>, io::Error> {
 
         let keyboards = devices.into_iter().filter_map(map_to_keyboard).collect();
         CFRelease(device_set);
-
         Ok(keyboards)
     }
 }

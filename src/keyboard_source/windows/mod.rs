@@ -1,8 +1,9 @@
 mod device;
+mod key_mapping;
 mod window;
-
 use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource};
 use device::DeviceEnumerator;
+pub use keyboard_types::KeyboardEvent as KeyEvent;
 use std::{
     io,
     sync::{

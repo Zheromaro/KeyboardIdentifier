@@ -1,7 +1,12 @@
-use super::device::{DeviceEnumerator, DeviceHandle, DiscoveredKeyboard, RawInput};
+use super::{
+    KeyEvent,
+    device::{DeviceEnumerator, DeviceHandle, DiscoveredKeyboard, RawInput},
+    key_mapping::*,
+};
 use crate::keyboard_source::{Keyboard, KeyboardEvent};
-use keyboard_types::Code;
+use keyboard_types::{KeyState, Modifiers};
 use std::{
+    collections::HashSet,
     ffi::c_void,
     io,
     ptr::null_mut,
@@ -17,7 +22,9 @@ use windows::Win32::{
     },
     UI::{
         Input::{
-            RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RegisterRawInputDevices,
+            KeyboardAndMouse::{VIRTUAL_KEY, VK_CAPITAL, VK_NUMLOCK, VK_SCROLL},
+            RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE,
+            RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
             CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -65,6 +72,8 @@ impl WindowHandleSlot {
 pub(crate) struct WindowState {
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     keyboards: Vec<(DeviceHandle, Arc<Keyboard>)>,
+    modifiers: Modifiers,
+    pressed_keys: HashSet<(DeviceHandle, u16)>,
 }
 
 impl WindowState {
@@ -78,6 +87,8 @@ impl WindowState {
                 .into_iter()
                 .map(|d| (d.handle, Arc::new(d.keyboard)))
                 .collect(),
+            modifiers: Modifiers::empty(),
+            pressed_keys: HashSet::new(),
         }
     }
 
@@ -98,6 +109,7 @@ impl WindowState {
             GIDC_REMOVAL => {
                 if let Some(index) = self.keyboards.iter().position(|(c, _)| c == &device) {
                     let keyboard = self.keyboards.remove(index).1;
+                    self.pressed_keys.retain(|(d, _)| d != &device);
                     let _ = self
                         .sender
                         .blocking_send(Ok(KeyboardEvent::Unplugged(keyboard)));
@@ -111,7 +123,7 @@ impl WindowState {
         let Ok(input) = RawInput::from_message(lparam) else {
             return;
         };
-        if !input.is_keyboard() || !input.is_key_down() {
+        if !input.is_keyboard() {
             return;
         }
         let handle = input.device();
@@ -135,16 +147,58 @@ impl WindowState {
             }
         };
 
-        let os_code = input.scancode() as usize;
+        let raw_vkey = input.vkey();
+        let vkey = VIRTUAL_KEY(raw_vkey);
+        let is_e0 = input.is_extended();
+        let is_up = input.is_key_up();
 
-        let mapped_code = WINDOWS_SCANCODE_MAP
-            .get(os_code)
-            .copied()
-            .unwrap_or(Code::Unidentified);
+        let state = if is_up { KeyState::Up } else { KeyState::Down };
+
+        let key_tuple = (device, raw_vkey);
+        let repeat = if is_up {
+            self.pressed_keys.remove(&key_tuple);
+            false
+        } else {
+            !self.pressed_keys.insert(key_tuple)
+        };
+
+        let modifier = modifier_for_key(vkey, is_e0);
+        let is_lock_key = matches!(vkey, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL);
+
+        let event_modifiers = match state {
+            KeyState::Down => {
+                if let Some(modifier) = modifier {
+                    if is_lock_key && !repeat {
+                        self.modifiers.toggle(modifier);
+                    } else if !is_lock_key {
+                        self.modifiers.insert(modifier);
+                    }
+                }
+                self.modifiers
+            }
+            KeyState::Up => {
+                if !is_lock_key {
+                    if let Some(modifier) = modifier {
+                        self.modifiers.remove(modifier);
+                    }
+                }
+                self.modifiers
+            }
+        };
+
+        let key_event = KeyEvent {
+            state,
+            key: raw_to_key(vkey),
+            code: raw_to_code(vkey, is_e0, input.scancode()),
+            location: raw_to_location(vkey, is_e0),
+            modifiers: event_modifiers,
+            repeat,
+            is_composing: false,
+        };
 
         let _ = self
             .sender
-            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard, mapped_code)));
+            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard, key_event)));
     }
 }
 

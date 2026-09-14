@@ -22,7 +22,7 @@ use windows::Win32::{
             GetRawInputData, GetRawInputDeviceInfoW, GetRawInputDeviceList, HRAWINPUT, RAWINPUT,
             RAWINPUTDEVICELIST, RAWINPUTHEADER, RID_INPUT, RIDI_DEVICENAME, RIM_TYPEKEYBOARD,
         },
-        WindowsAndMessaging::{WM_KEYDOWN, WM_SYSKEYDOWN},
+        WindowsAndMessaging::{WM_KEYUP, WM_SYSKEYUP},
     },
 };
 use windows::core::PCWSTR;
@@ -141,7 +141,6 @@ impl DeviceEnumerator {
     }
 
     fn extract_hex(val: &str, prefix: &str) -> Option<String> {
-        // prefix is expected to be uppercase, e.g., "VID_"
         let upper_val = val.to_ascii_uppercase();
         let start = upper_val.find(prefix)?;
 
@@ -385,9 +384,7 @@ impl RawInput {
             return Err(win32_error("GetRawInputData(data) failed"));
         }
 
-        // SAFETY: GetRawInputData initialized the buffer up to `size` bytes.
         let value = unsafe { Box::from_raw(buf.as_mut_ptr() as *mut RAWINPUT) };
-        // Prevent the Vec from dropping the memory since Box now owns it
         std::mem::forget(buf);
 
         Ok(Self { value })
@@ -396,13 +393,32 @@ impl RawInput {
     pub(crate) fn device(&self) -> HANDLE {
         self.value.header.hDevice
     }
+
     pub(crate) fn is_keyboard(&self) -> bool {
         self.value.header.dwType == RIM_TYPEKEYBOARD.0
     }
-    pub(crate) fn is_key_down(&self) -> bool {
-        matches!(
-            unsafe { self.value.data.keyboard.Message },
-            WM_KEYDOWN | WM_SYSKEYDOWN
-        )
+
+    pub(crate) fn vkey(&self) -> u16 {
+        unsafe { self.value.data.keyboard.VKey }
+    }
+
+    pub(crate) fn flags(&self) -> u16 {
+        unsafe { self.value.data.keyboard.Flags }
+    }
+
+    pub(crate) fn is_key_up(&self) -> bool {
+        (self.flags() & 0x01) != 0
+            || matches!(
+                unsafe { self.value.data.keyboard.Message },
+                WM_KEYUP | WM_SYSKEYUP
+            )
+    }
+
+    pub(crate) fn scancode(&self) -> u16 {
+        unsafe { self.value.data.keyboard.MakeCode }
+    }
+
+    pub(crate) fn is_extended(&self) -> bool {
+        (self.flags() & 0x02) != 0
     }
 }
