@@ -1,350 +1,281 @@
-use super::{
-    KeyEvent,
-    device::{DeviceEnumerator, DeviceHandle, DiscoveredKeyboard, RawInput},
-    key_mapping::*,
-};
+use super::{device::DeviceEnumerator, key_mapping::*, InterceptionCommand};
 use crate::keyboard_source::{Keyboard, KeyboardEvent};
-use keyboard_types::{KeyState, Modifiers};
+use interception::{Filter, Interception, KeyFilter, KeyState, ScanCode};
 use std::{
-    collections::HashSet,
-    ffi::c_void,
+    collections::{HashMap, HashSet},
     io,
-    ptr::null_mut,
-    sync::{
-        Arc,
-        atomic::{AtomicIsize, Ordering},
-    },
+    sync::{mpsc, Arc, RwLock},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
-use windows::Win32::{
-    Foundation::{
-        ERROR_CLASS_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
-    },
-    UI::{
-        Input::{
-            KeyboardAndMouse::{VIRTUAL_KEY, VK_CAPITAL, VK_NUMLOCK, VK_SCROLL},
-            RAWINPUTDEVICE, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE,
-            RegisterRawInputDevices,
-        },
-        WindowsAndMessaging::{
-            CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GWLP_USERDATA, GetMessageW,
-            GetWindowLongPtrW, HWND_MESSAGE, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-            SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_INPUT,
-            WM_INPUT_DEVICE_CHANGE, WM_NCCREATE, WM_NCDESTROY, WNDCLASSEXW,
-        },
-    },
-};
-use windows::core::w;
+use tokio::sync::oneshot;
 
-const WINDOW_CLASS_NAME: windows::core::PCWSTR = w!("KeyboardIdentifierRawInputWindow");
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
-#[derive(Debug)]
-pub(crate) struct WindowHandleSlot {
-    value: AtomicIsize,
+pub(crate) struct InputThread {
+    command_tx: mpsc::Sender<InterceptionCommand>,
+    thread: Option<JoinHandle<()>>,
 }
 
-impl WindowHandleSlot {
-    pub(crate) fn new() -> Self {
-        Self {
-            value: AtomicIsize::new(0),
-        }
-    }
-
-    pub(crate) fn store(&self, hwnd: HWND) {
-        self.value.store(hwnd.0 as isize, Ordering::Release);
-    }
-
-    pub(crate) fn clear(&self) {
-        self.value.store(0, Ordering::Release);
-    }
-
-    pub(crate) fn close(&self) {
-        let value = self.value.load(Ordering::Acquire);
-        if value != 0 {
-            unsafe {
-                let _ = PostMessageW(HWND(value as *mut c_void), WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
-        }
-    }
-}
-
-pub(crate) struct WindowState {
-    sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-    keyboards: Vec<(DeviceHandle, Arc<Keyboard>)>,
-    modifiers: Modifiers,
-    pressed_keys: HashSet<(DeviceHandle, u16)>,
-}
-
-impl WindowState {
-    pub(crate) fn new(
-        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-        keyboards: Vec<DiscoveredKeyboard>,
+impl InputThread {
+    pub(crate) fn spawn(
+        event_tx: tokio::sync::mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+        keyboards: Arc<RwLock<Vec<Keyboard>>>,
+        init_tx: oneshot::Sender<io::Result<()>>,
     ) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let result = run_interception(command_rx, event_tx, keyboards);
+            let _ = init_tx.send(result);
+        });
+
         Self {
-            sender,
-            keyboards: keyboards
-                .into_iter()
-                .map(|d| (d.handle, Arc::new(d.keyboard)))
-                .collect(),
-            modifiers: Modifiers::empty(),
-            pressed_keys: HashSet::new(),
+            command_tx,
+            thread: Some(thread),
         }
     }
 
-    fn handle_device_change(&mut self, action: u32, handle: HANDLE) {
-        let device = DeviceHandle::from(handle);
-        match action {
-            GIDC_ARRIVAL => {
-                if !self.keyboards.iter().any(|(c, _)| c == &device) {
-                    if let Some(keyboard) = DeviceEnumerator::keyboard_from_handle(handle) {
-                        let keyboard = Arc::new(keyboard);
-                        self.keyboards.push((device, Arc::clone(&keyboard)));
-                        let _ = self
-                            .sender
-                            .blocking_send(Ok(KeyboardEvent::Plugged(keyboard)));
-                    }
-                }
-            }
-            GIDC_REMOVAL => {
-                if let Some(index) = self.keyboards.iter().position(|(c, _)| c == &device) {
-                    let keyboard = self.keyboards.remove(index).1;
-                    self.pressed_keys.retain(|(d, _)| d != &device);
-                    let _ = self
-                        .sender
-                        .blocking_send(Ok(KeyboardEvent::Unplugged(keyboard)));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_input(&mut self, lparam: LPARAM) {
-        let Ok(input) = RawInput::from_message(lparam) else {
-            return;
-        };
-        if !input.is_keyboard() {
-            return;
-        }
-        let handle = input.device();
-        let device = DeviceHandle::from(handle);
-
-        let keyboard = match self
-            .keyboards
-            .iter()
-            .find(|(c, _)| c == &device)
-            .map(|(_, k)| Arc::clone(k))
-        {
-            Some(k) => k,
-            None => {
-                if let Some(k) = DeviceEnumerator::keyboard_from_handle(handle) {
-                    let k = Arc::new(k);
-                    self.keyboards.push((device, Arc::clone(&k)));
-                    k
-                } else {
-                    return;
-                }
-            }
-        };
-
-        let raw_vkey = input.vkey();
-        let vkey = VIRTUAL_KEY(raw_vkey);
-        let is_e0 = input.is_extended();
-        let is_up = input.is_key_up();
-
-        let state = if is_up { KeyState::Up } else { KeyState::Down };
-
-        let key_tuple = (device, raw_vkey);
-        let repeat = if is_up {
-            self.pressed_keys.remove(&key_tuple);
-            false
-        } else {
-            !self.pressed_keys.insert(key_tuple)
-        };
-
-        let modifier = modifier_for_key(vkey, is_e0);
-        let is_lock_key = matches!(vkey, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL);
-
-        let event_modifiers = match state {
-            KeyState::Down => {
-                if let Some(modifier) = modifier {
-                    if is_lock_key && !repeat {
-                        self.modifiers.toggle(modifier);
-                    } else if !is_lock_key {
-                        self.modifiers.insert(modifier);
-                    }
-                }
-                self.modifiers
-            }
-            KeyState::Up => {
-                if !is_lock_key {
-                    if let Some(modifier) = modifier {
-                        self.modifiers.remove(modifier);
-                    }
-                }
-                self.modifiers
-            }
-        };
-
-        let key_event = KeyEvent {
-            state,
-            key: raw_to_key(vkey),
-            code: raw_to_code(vkey, is_e0, input.scancode()),
-            location: raw_to_location(vkey, is_e0),
-            modifiers: event_modifiers,
-            repeat,
-            is_composing: false,
-        };
-
-        let _ = self
-            .sender
-            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard, key_event)));
+    pub(crate) fn send_command(&self, command: InterceptionCommand) -> io::Result<()> {
+        self.command_tx.send(command).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Windows input thread exited")
+        })
     }
 }
 
-pub(crate) struct MessageOnlyWindow {
-    hwnd: HWND,
+impl Drop for InputThread {
+    fn drop(&mut self) {
+        let _ = self.command_tx.send(InterceptionCommand::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
-impl MessageOnlyWindow {
-    pub(crate) fn create(
-        instance: HINSTANCE,
-        state: WindowState,
-    ) -> Result<Self, windows::core::Error> {
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(Self::wnd_proc),
-            hInstance: instance,
-            lpszClassName: WINDOW_CLASS_NAME,
-            ..Default::default()
+struct InterceptionState {
+    context: Interception,
+    keyboards: HashMap<interception::Device, Arc<Keyboard>>,
+    consumed: HashSet<interception::Device>,
+    pressed_keys: HashSet<(interception::Device, ScanCode)>,
+    modifiers: keyboard_types::Modifiers,
+    last_device_refresh: Instant,
+}
+
+fn run_interception(
+    command_rx: mpsc::Receiver<InterceptionCommand>,
+    event_tx: tokio::sync::mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    keyboard_snapshot: Arc<RwLock<Vec<Keyboard>>>,
+) -> io::Result<()> {
+    let Some(context) = Interception::new() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "failed to create Interception context; make sure the Interception driver is installed",
+        ));
+    };
+
+    context.set_filter(
+        interception::is_keyboard,
+        Filter::KeyFilter(KeyFilter::DOWN | KeyFilter::UP | KeyFilter::E0 | KeyFilter::E1),
+    );
+
+    let mut state = InterceptionState {
+        context,
+        keyboards: HashMap::new(),
+        consumed: HashSet::new(),
+        pressed_keys: HashSet::new(),
+        modifiers: keyboard_types::Modifiers::empty(),
+        last_device_refresh: Instant::now() - DEVICE_REFRESH_INTERVAL,
+    };
+
+    refresh_devices(&mut state, &event_tx, &keyboard_snapshot, false)?;
+
+    loop {
+        if process_commands(&mut state, &command_rx)? {
+            break;
+        }
+
+        let device = state.context.wait_with_timeout(POLL_INTERVAL);
+        if interception::is_invalid(device) {
+            if state.last_device_refresh.elapsed() >= DEVICE_REFRESH_INTERVAL {
+                refresh_devices(&mut state, &event_tx, &keyboard_snapshot, true)?;
+            }
+            continue;
+        }
+
+        if !interception::is_keyboard(device) {
+            continue;
+        }
+
+        let mut strokes = [interception::Stroke::Keyboard {
+            code: ScanCode::Esc,
+            state: KeyState::UP,
+            information: 0,
+        }];
+
+        let received = state.context.receive(device, &mut strokes);
+        if received <= 0 {
+            continue;
+        }
+
+        let Some(keyboard) = state.keyboards.get(&device).cloned() else {
+            refresh_devices(&mut state, &event_tx, &keyboard_snapshot, true)?;
+            continue;
         };
-        if unsafe { RegisterClassExW(&class) } == 0
-            && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
-        {
-            return Err(windows::core::Error::from_win32());
+
+        for stroke in strokes.into_iter().take(received as usize) {
+            let interception::Stroke::Keyboard {
+                code,
+                state: key_state,
+                ..
+            } = stroke else {
+                continue;
+            };
+
+            let is_up = key_state.contains(KeyState::UP);
+            let key_tuple = (device, code);
+            let repeat = if is_up {
+                state.pressed_keys.remove(&key_tuple);
+                false
+            } else {
+                !state.pressed_keys.insert(key_tuple)
+            };
+
+            update_modifiers(&mut state.modifiers, code, key_state, repeat);
+            let event = interception_to_key_event(code, key_state, state.modifiers, repeat);
+
+            let _ = event_tx.blocking_send(Ok(KeyboardEvent::KeyAction(
+                Arc::clone(&keyboard),
+                event,
+            )));
+
+            // Interception is pass-through until we deliberately consume the
+            // device. A consumed stroke is therefore intentionally not sent.
+            if !state.consumed.contains(&device) {
+                let sent = state.context.send(device, &[stroke]);
+                if sent != 1 {
+                    return Err(io::Error::other(format!(
+                        "Interception failed to forward keyboard stroke (returned {sent})"
+                    )));
+                }
+            }
         }
 
-        let state_ptr = Box::into_raw(Box::new(state));
-        match unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                WINDOW_CLASS_NAME,
-                w!(""),
-                WINDOW_STYLE::default(),
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                HWND_MESSAGE,
-                None,
-                instance,
-                Some(state_ptr.cast::<c_void>()),
+        if state.last_device_refresh.elapsed() >= DEVICE_REFRESH_INTERVAL {
+            refresh_devices(&mut state, &event_tx, &keyboard_snapshot, true)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `true` when the worker should stop.
+fn process_commands(
+    state: &mut InterceptionState,
+    command_rx: &mpsc::Receiver<InterceptionCommand>,
+) -> io::Result<bool> {
+    while let Ok(command) = command_rx.try_recv() {
+        match command {
+            InterceptionCommand::Consume { keyboard, reply } => {
+                let result = set_consumed(state, &keyboard, true);
+                let _ = reply.send(result);
+            }
+            InterceptionCommand::Release { keyboard, reply } => {
+                let result = set_consumed(state, &keyboard, false);
+                let _ = reply.send(result);
+            }
+            InterceptionCommand::Stop => return Ok(true),
+        }
+    }
+
+    Ok(false)
+}
+
+fn set_consumed(
+    state: &mut InterceptionState,
+    keyboard: &Keyboard,
+    consumed: bool,
+) -> io::Result<()> {
+    let device = state
+        .keyboards
+        .iter()
+        .find(|(_, current)| current.as_ref() == keyboard)
+        .map(|(device, _)| *device)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "keyboard is not currently connected",
             )
-        } {
-            Ok(hwnd) => Ok(Self { hwnd }),
-            Err(e) => {
-                unsafe {
-                    drop(Box::from_raw(state_ptr));
-                }
-                Err(e)
-            }
+        })?;
+
+    if consumed {
+        state.consumed.insert(device);
+    } else {
+        state.consumed.remove(&device);
+    }
+
+    Ok(())
+}
+
+fn refresh_devices(
+    state: &mut InterceptionState,
+    event_tx: &tokio::sync::mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    keyboard_snapshot: &Arc<RwLock<Vec<Keyboard>>>,
+    emit_changes: bool,
+) -> io::Result<()> {
+    let discovered = DeviceEnumerator::enumerate_keyboards(&state.context)?;
+    let mut current = HashMap::new();
+
+    for device in discovered {
+        current.insert(device.handle.0, Arc::new(device.keyboard));
+    }
+
+    for (device, keyboard) in &current {
+        if emit_changes && !state.keyboards.contains_key(device) {
+            let _ = event_tx.blocking_send(Ok(KeyboardEvent::Plugged(Arc::clone(keyboard))));
         }
     }
 
-    pub(crate) fn hwnd(&self) -> HWND {
-        self.hwnd
-    }
-
-    pub(crate) fn destroy(&self) {
-        unsafe {
-            let _ = DestroyWindow(self.hwnd);
+    for (device, keyboard) in state.keyboards.drain() {
+        if emit_changes && !current.contains_key(&device) {
+            state.consumed.remove(&device);
+            state.pressed_keys.retain(|(d, _)| d != &device);
+            let _ = event_tx.blocking_send(Ok(KeyboardEvent::Unplugged(keyboard)));
         }
     }
 
-    pub(crate) fn register_raw_input(&self) -> io::Result<()> {
-        let device = RAWINPUTDEVICE {
-            usUsagePage: 0x01,
-            usUsage: 0x06,
-            dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
-            hwndTarget: self.hwnd,
-        };
-        unsafe {
-            RegisterRawInputDevices(
-                std::slice::from_ref(&device),
-                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-            )
-        }
-        .map_err(io::Error::other)
+    state.keyboards = current;
+
+    if let Ok(mut snapshot) = keyboard_snapshot.write() {
+        snapshot.clear();
+        snapshot.extend(state.keyboards.values().map(|keyboard| keyboard.as_ref().clone()));
     }
 
-    pub(crate) fn run_message_loop(&self) {
-        let mut message = MSG::default();
-        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
-            unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
-    }
+    state.last_device_refresh = Instant::now();
+    Ok(())
+}
 
-    unsafe extern "system" fn wnd_proc(
-        hwnd: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        match msg {
-            WM_NCCREATE => {
-                unsafe {
-                    let state = (*(lparam.0 as *const CREATESTRUCTW)).lpCreateParams;
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-                }
-                LRESULT(1)
-            }
-            WM_CLOSE => {
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                }
-                LRESULT(0)
-            }
-            WM_INPUT_DEVICE_CHANGE => {
-                if let Some(state) =
-                    unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState).as_mut() }
-                {
-                    state.handle_device_change(wparam.0 as u32, HANDLE(lparam.0 as *mut c_void));
-                }
-                LRESULT(0)
-            }
-            WM_INPUT => {
-                if let Some(state) =
-                    unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState).as_mut() }
-                {
-                    state.handle_input(lparam);
-                }
-                LRESULT(0)
-            }
-            WM_NCDESTROY => {
-                unsafe {
-                    let device = RAWINPUTDEVICE {
-                        usUsagePage: 0x01,
-                        usUsage: 0x06,
-                        dwFlags: RIDEV_REMOVE,
-                        hwndTarget: HWND(null_mut()),
-                    };
-                    let _ = RegisterRawInputDevices(
-                        std::slice::from_ref(&device),
-                        std::mem::size_of::<RAWINPUTDEVICE>() as u32,
-                    );
-                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    if !ptr.is_null() {
-                        drop(Box::from_raw(ptr));
-                    }
-                    PostQuitMessage(0);
-                }
-                LRESULT(0)
-            }
-            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+fn update_modifiers(
+    modifiers: &mut keyboard_types::Modifiers,
+    code: ScanCode,
+    state: KeyState,
+    repeat: bool,
+) {
+    let Some(modifier) = modifier_for_key(code, state) else {
+        return;
+    };
+
+    let scan_code = code as u16;
+    let is_lock = matches!(scan_code, 0x3A | 0x45 | 0x46);
+
+    if state.contains(KeyState::UP) {
+        if !is_lock {
+            modifiers.remove(modifier);
         }
+    } else if is_lock {
+        if !repeat {
+            modifiers.toggle(modifier);
+        }
+    } else {
+        modifiers.insert(modifier);
     }
 }

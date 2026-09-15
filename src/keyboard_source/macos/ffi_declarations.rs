@@ -14,6 +14,9 @@ pub type IOHIDElementRef = *mut c_void;
 pub type IOHIDDeviceCallback = extern "C" fn(*mut c_void, i32, *mut c_void, IOHIDDeviceRef);
 pub type IOHIDValueCallback = extern "C" fn(*mut c_void, i32, *mut c_void, IOHIDValueRef);
 
+/// `io_service_t` is a Mach port name used by IOKit.
+pub type IoServiceT = u32;
+
 unsafe extern "C" {
     pub static kCFTypeDictionaryKeyCallBacks: *const c_void;
     pub static kCFTypeDictionaryValueCallBacks: *const c_void;
@@ -93,6 +96,15 @@ unsafe extern "C" {
     pub fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) -> i32;
     pub fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) -> i32;
     pub fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
+
+    pub fn IOHIDDeviceCreate(allocator: *mut c_void, service: IoServiceT) -> IOHIDDeviceRef;
+
+    pub fn IOHIDDeviceGetService(device: IOHIDDeviceRef) -> IoServiceT;
+
+    pub fn IOHIDDeviceOpen(device: IOHIDDeviceRef, options: u32) -> i32;
+
+    pub fn IOHIDDeviceClose(device: IOHIDDeviceRef, options: u32) -> i32;
+
     pub fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) -> CFTypeRef;
     pub fn IOHIDValueGetIntegerValue(value: IOHIDValueRef) -> isize;
     pub fn IOHIDValueGetElement(value: IOHIDValueRef) -> IOHIDElementRef;

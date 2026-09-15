@@ -15,12 +15,20 @@ pub(super) extern "C" fn matching_callback(
     if context.is_null() {
         return;
     }
+
     let ctx = unsafe { &mut *(context as *mut HidContext) };
+
     if let Some(keyboard) = map_to_keyboard(device) {
         let kb_arc = Arc::new(keyboard);
         let device_id = device as isize;
+
         ctx.keyboards.insert(device_id, kb_arc.clone());
         ctx.modifiers.insert(device_id, Modifiers::empty());
+
+        if let Ok(mut devices) = ctx.devices.lock() {
+            devices.insert(device_id, (kb_arc.clone(), device as usize));
+        }
+
         if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Plugged(kb_arc))) {
             warn!(error = %e, "Dropped Plugged event: channel full");
         }
@@ -36,9 +44,25 @@ pub(super) extern "C" fn removal_callback(
     if context.is_null() {
         return;
     }
+
     let ctx = unsafe { &mut *(context as *mut HidContext) };
     let device_id = device as isize;
+
     ctx.modifiers.remove(&device_id);
+
+    if let Ok(mut consumed) = ctx.consumed.lock() {
+        if let Some(consumed_device) = consumed.remove(&device_id) {
+            unsafe {
+                let _ = IOHIDDeviceClose(consumed_device as IOHIDDeviceRef, 0);
+                CFRelease(consumed_device as CFTypeRef);
+            }
+        }
+    }
+
+    if let Ok(mut devices) = ctx.devices.lock() {
+        devices.remove(&device_id);
+    }
+
     if let Some(kb) = ctx.keyboards.remove(&device_id) {
         if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Unplugged(kb))) {
             warn!(error = %e, "Dropped Unplugged event: channel full");
@@ -102,7 +126,7 @@ pub(super) extern "C" fn input_callback(
 
         if let Err(e) = ctx
             .sender
-            .try_send(Ok(KeyboardEvent::Pressed(kb.clone(), key_event)))
+            .try_send(Ok(KeyboardEvent::KeyAction(kb.clone(), key_event)))
         {
             warn!(error = %e, "Dropped Pressed event: channel full");
         }

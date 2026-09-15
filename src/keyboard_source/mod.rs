@@ -139,4 +139,16 @@ pub trait KeyboardSource: Sized {
     fn receive_event(
         &mut self,
     ) -> impl Future<Output = Result<KeyboardEvent, std::io::Error>> + Send;
+
+    /// Consumes (grabs) a specific keyboard device.
+    ///
+    /// Once consumed, the keyboard's input is suppressed and will not reach
+    /// other applications or the operating system.
+    fn consume(&mut self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Releases a previously consumed keyboard device.
+    ///
+    /// Once released, the keyboard's input will pass through normally to
+    /// other applications and the operating system.
+    fn release(&mut self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send;
 }

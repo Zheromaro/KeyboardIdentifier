@@ -1,4 +1,5 @@
 mod key_mapping;
+
 use super::{Keyboard, KeyboardEvent, KeyboardID, KeyboardSource, PortID};
 use evdev::{Device as EvdevDevice, KeyCode};
 use key_mapping::*;
@@ -6,7 +7,7 @@ use keyboard_types::{KeyboardEvent as KeyEvent, Modifiers};
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 use tokio::{
     io::unix::AsyncFd,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
 use tracing::error;
@@ -16,6 +17,7 @@ const ENODEV: i32 = 19;
 
 pub struct LinuxKeyboardSource {
     receiver: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
+    command_sender: mpsc::Sender<SourceCommand>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -24,11 +26,21 @@ impl KeyboardSource for LinuxKeyboardSource {
         let monitor = AsyncFd::new(create_monitor()?)?;
 
         let (sender, receiver) = mpsc::channel(128);
+        let (command_sender, command_receiver) = mpsc::channel(32);
         let (shutdown, _) = broadcast::channel(1);
 
-        tokio::spawn(udev_loop(monitor, sender, shutdown.subscribe()));
+        tokio::spawn(udev_loop(
+            monitor,
+            sender,
+            command_receiver,
+            shutdown.subscribe(),
+        ));
 
-        Ok(Self { receiver, shutdown })
+        Ok(Self {
+            receiver,
+            command_sender,
+            shutdown,
+        })
     }
 
     async fn receive_event(&mut self) -> Result<KeyboardEvent, io::Error> {
@@ -40,6 +52,38 @@ impl KeyboardSource for LinuxKeyboardSource {
                 "Linux device event channel closed",
             )),
         }
+    }
+
+    async fn consume(&mut self, keyboard: &Keyboard) -> io::Result<()> {
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.command_sender
+            .send(SourceCommand::Consume {
+                keyboard: keyboard.clone(),
+                response_sender,
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "keyboard source stopped"))?;
+
+        response_receiver
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "keyboard task stopped"))?
+    }
+
+    async fn release(&mut self, keyboard: &Keyboard) -> io::Result<()> {
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.command_sender
+            .send(SourceCommand::Release {
+                keyboard: keyboard.clone(),
+                response_sender,
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "keyboard source stopped"))?;
+
+        response_receiver
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "keyboard task stopped"))?
     }
 
     fn enumerate_keyboards(&self) -> Vec<Keyboard> {
@@ -67,17 +111,71 @@ impl Drop for LinuxKeyboardSource {
     }
 }
 
+enum SourceCommand {
+    Consume {
+        keyboard: Keyboard,
+        response_sender: oneshot::Sender<io::Result<()>>,
+    },
+    Release {
+        keyboard: Keyboard,
+        response_sender: oneshot::Sender<io::Result<()>>,
+    },
+}
+
+enum DeviceCommandKind {
+    Consume,
+    Release,
+}
+
+impl DeviceCommandKind {
+    fn into_command(self, response_sender: oneshot::Sender<io::Result<()>>) -> DeviceCommand {
+        match self {
+            Self::Consume => DeviceCommand::Consume(response_sender),
+            Self::Release => DeviceCommand::Release(response_sender),
+        }
+    }
+}
+
+enum DeviceCommand {
+    Consume(oneshot::Sender<io::Result<()>>),
+    Release(oneshot::Sender<io::Result<()>>),
+}
+
+impl DeviceCommand {
+    fn into_response_sender(self) -> oneshot::Sender<io::Result<()>> {
+        match self {
+            Self::Consume(response_sender) | Self::Release(response_sender) => response_sender,
+        }
+    }
+}
+
+struct ManagedKeyboard {
+    keyboard: Arc<Keyboard>,
+    command_sender: mpsc::Sender<DeviceCommand>,
+    event_task: JoinHandle<()>,
+}
+
 async fn udev_loop(
     monitor: AsyncFd<MonitorSocket>,
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    mut command_receiver: mpsc::Receiver<SourceCommand>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
-    let mut keyboards: HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)> = HashMap::new();
+    let mut keyboards: HashMap<PathBuf, ManagedKeyboard> = HashMap::new();
+
+    // Channel to receive notifications when an evdev task exits prematurely
+    let (device_exit_sender, mut device_exit_receiver) = mpsc::channel(32);
 
     match enumerate_keyboards() {
         Ok(initial_keyboards) => {
             for (devnode, keyboard) in initial_keyboards {
-                spawn_evdev(&mut keyboards, devnode, keyboard, &sender);
+                spawn_evdev(
+                    &mut keyboards,
+                    devnode,
+                    keyboard,
+                    &sender,
+                    device_exit_sender.clone(),
+                );
             }
         }
 
@@ -97,6 +195,21 @@ async fn udev_loop(
                 break;
             }
 
+            // Handle premature exit of an evdev task to prevent "ghost" devices
+            Some(exited_devnode) = device_exit_receiver.recv() => {
+                keyboards.remove(&exited_devnode);
+            }
+
+            command = command_receiver.recv() => {
+                match command {
+                    Some(command) => {
+                        handle_source_command(command, &keyboards).await;
+                    }
+
+                    None => break,
+                }
+            }
+
             result = monitor.readable() => {
                 let mut guard = match result {
                     Ok(guard) => guard,
@@ -112,6 +225,7 @@ async fn udev_loop(
                         event,
                         &mut keyboards,
                         &sender,
+                        device_exit_sender.clone(),
                     )
                     .await;
                 }
@@ -124,9 +238,50 @@ async fn udev_loop(
     shutdown_evdev_tasks(keyboards);
 }
 
-fn shutdown_evdev_tasks(keyboards: HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)>) {
-    for (_, (_, handle)) in keyboards {
-        handle.abort();
+async fn handle_source_command(
+    command: SourceCommand,
+    keyboards: &HashMap<PathBuf, ManagedKeyboard>,
+) {
+    let (keyboard, response_sender, command_kind) = match command {
+        SourceCommand::Consume {
+            keyboard,
+            response_sender,
+        } => (keyboard, response_sender, DeviceCommandKind::Consume),
+
+        SourceCommand::Release {
+            keyboard,
+            response_sender,
+        } => (keyboard, response_sender, DeviceCommandKind::Release),
+    };
+
+    let Some(command_sender) = keyboards
+        .values()
+        .find(|managed| managed.keyboard.as_ref() == &keyboard)
+        .map(|managed| managed.command_sender.clone())
+    else {
+        let _ = response_sender.send(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("keyboard not found: {keyboard}"),
+        )));
+
+        return;
+    };
+
+    let device_command = command_kind.into_command(response_sender);
+
+    if let Err(error) = command_sender.send(device_command).await {
+        let response_sender = error.0.into_response_sender();
+
+        let _ = response_sender.send(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "keyboard event task stopped",
+        )));
+    }
+}
+
+fn shutdown_evdev_tasks(keyboards: HashMap<PathBuf, ManagedKeyboard>) {
+    for (_, managed) in keyboards {
+        managed.event_task.abort();
     }
 }
 
@@ -136,8 +291,9 @@ fn create_monitor() -> io::Result<MonitorSocket> {
 
 async fn handle_udev_event(
     event: udev::Event,
-    keyboards: &mut HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)>,
+    keyboards: &mut HashMap<PathBuf, ManagedKeyboard>,
     sender: &mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    device_exit_sender: mpsc::Sender<PathBuf>,
 ) {
     let dev = event.device();
 
@@ -167,14 +323,16 @@ async fn handle_udev_event(
                 return;
             }
 
-            spawn_evdev(keyboards, devnode, keyboard, sender);
+            spawn_evdev(keyboards, devnode, keyboard, sender, device_exit_sender);
         }
 
         EventType::Remove => {
-            if let Some((keyboard, handle)) = keyboards.remove(&devnode) {
-                handle.abort();
+            if let Some(managed) = keyboards.remove(&devnode) {
+                managed.event_task.abort();
 
-                let _ = sender.send(Ok(KeyboardEvent::Unplugged(keyboard))).await;
+                let _ = sender
+                    .send(Ok(KeyboardEvent::Unplugged(managed.keyboard)))
+                    .await;
             }
         }
 
@@ -183,10 +341,11 @@ async fn handle_udev_event(
 }
 
 fn spawn_evdev(
-    keyboards: &mut HashMap<PathBuf, (Arc<Keyboard>, JoinHandle<()>)>,
+    keyboards: &mut HashMap<PathBuf, ManagedKeyboard>,
     devnode: PathBuf,
     keyboard: Arc<Keyboard>,
     sender: &mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    device_exit_sender: mpsc::Sender<PathBuf>,
 ) {
     if keyboards.contains_key(&devnode) {
         return;
@@ -195,18 +354,35 @@ fn spawn_evdev(
     let sender = sender.clone();
     let keyboard_for_task = keyboard.clone();
     let devnode_for_task = devnode.clone();
+    let (command_sender, command_receiver) = mpsc::channel(8);
 
-    let handle = tokio::spawn(async move {
-        evdev_loop(devnode_for_task, keyboard_for_task, sender).await;
+    let event_task = tokio::spawn(async move {
+        evdev_loop(
+            devnode_for_task,
+            keyboard_for_task,
+            sender,
+            command_receiver,
+            device_exit_sender,
+        )
+        .await;
     });
 
-    keyboards.insert(devnode, (keyboard, handle));
+    keyboards.insert(
+        devnode,
+        ManagedKeyboard {
+            keyboard,
+            command_sender,
+            event_task,
+        },
+    );
 }
 
 async fn evdev_loop(
     devnode: PathBuf,
     keyboard: Arc<Keyboard>,
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    mut command_receiver: mpsc::Receiver<DeviceCommand>,
+    device_exit_sender: mpsc::Sender<PathBuf>,
 ) {
     let mut stream = match EvdevDevice::open(&devnode).and_then(|device| device.into_event_stream())
     {
@@ -214,6 +390,7 @@ async fn evdev_loop(
 
         Err(error) => {
             let _ = sender.send(Err(error)).await;
+            let _ = device_exit_sender.send(devnode.clone()).await;
             return;
         }
     };
@@ -221,19 +398,41 @@ async fn evdev_loop(
     let mut modifiers = Modifiers::empty();
 
     loop {
-        let event = match stream.next_event().await {
-            Ok(event) => event,
+        let event = tokio::select! {
+            biased;
 
-            Err(error) => {
-                if error.raw_os_error() != Some(ENODEV) {
-                    error!(
-                        error = %error,
-                        devnode = ?devnode,
-                        "evdev error",
-                    );
+            command = command_receiver.recv() => {
+                match command {
+                    Some(DeviceCommand::Consume(response_sender)) => {
+                        let _ = response_sender.send(stream.device_mut().grab());
+                        continue;
+                    }
+
+                    Some(DeviceCommand::Release(response_sender)) => {
+                        let _ = response_sender.send(stream.device_mut().ungrab());
+                        continue;
+                    }
+
+                    None => break,
                 }
+            }
 
-                break;
+            result = stream.next_event() => {
+                match result {
+                    Ok(event) => event,
+
+                    Err(error) => {
+                        if error.raw_os_error() != Some(ENODEV) {
+                            error!(
+                                error = %error,
+                                devnode = ?devnode,
+                                "evdev error",
+                            );
+                        }
+
+                        break;
+                    }
+                }
             }
         };
 
@@ -293,12 +492,11 @@ async fn evdev_loop(
             break;
         }
 
-        if state == keyboard_types::KeyState::Up {
-            if let Some(modifier) = modifier {
-                modifiers.remove(modifier);
-            }
-        }
+        // REMOVED: The redundant modifier removal block that broke CapsLock/NumLock
     }
+
+    // Notify the main loop that this device task has terminated so it can be cleaned up
+    let _ = device_exit_sender.send(devnode).await;
 }
 
 fn enumerate_keyboards() -> Result<Vec<(PathBuf, Arc<Keyboard>)>, io::Error> {

@@ -1,268 +1,215 @@
+use interception::{KeyState, ScanCode};
 use keyboard_types::{Code, Key, Location, Modifiers, NamedKey};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
-pub fn raw_to_code(vkey: VIRTUAL_KEY, is_e0: bool, scancode: u16) -> Code {
-    match vkey {
-        VK_ESCAPE => Code::Escape,
+pub(crate) fn interception_to_key_event(
+    code: ScanCode,
+    state: KeyState,
+    modifiers: Modifiers,
+    repeat: bool,
+) -> keyboard_types::KeyboardEvent {
+    keyboard_types::KeyboardEvent {
+        state: if state.contains(KeyState::UP) {
+            keyboard_types::KeyState::Up
+        } else {
+            keyboard_types::KeyState::Down
+        },
+        key: Key::Named(NamedKey::Unidentified),
+        code: scan_code_to_code(code, state),
+        location: scan_code_to_location(code, state),
+        modifiers,
+        repeat,
+        is_composing: false,
+    }
+}
 
-        VK_0 => Code::Digit0,
-        VK_1 => Code::Digit1,
-        VK_2 => Code::Digit2,
-        VK_3 => Code::Digit3,
-        VK_4 => Code::Digit4,
-        VK_5 => Code::Digit5,
-        VK_6 => Code::Digit6,
-        VK_7 => Code::Digit7,
-        VK_8 => Code::Digit8,
-        VK_9 => Code::Digit9,
+pub(crate) fn scan_code_to_code(code: ScanCode, state: KeyState) -> Code {
+    let scan_code = code as u16;
+    let e0 = state.contains(KeyState::E0);
+    let e1 = state.contains(KeyState::E1);
 
-        VK_A => Code::KeyA,
-        VK_B => Code::KeyB,
-        VK_C => Code::KeyC,
-        VK_D => Code::KeyD,
-        VK_E => Code::KeyE,
-        VK_F => Code::KeyF,
-        VK_G => Code::KeyG,
-        VK_H => Code::KeyH,
-        VK_I => Code::KeyI,
-        VK_J => Code::KeyJ,
-        VK_K => Code::KeyK,
-        VK_L => Code::KeyL,
-        VK_M => Code::KeyM,
-        VK_N => Code::KeyN,
-        VK_O => Code::KeyO,
-        VK_P => Code::KeyP,
-        VK_Q => Code::KeyQ,
-        VK_R => Code::KeyR,
-        VK_S => Code::KeyS,
-        VK_T => Code::KeyT,
-        VK_U => Code::KeyU,
-        VK_V => Code::KeyV,
-        VK_W => Code::KeyW,
-        VK_X => Code::KeyX,
-        VK_Y => Code::KeyY,
-        VK_Z => Code::KeyZ,
+    if e1 && scan_code == 0x45 {
+        return Code::Pause;
+    }
 
-        VK_RETURN => {
-            if is_e0 {
-                Code::NumpadEnter
-            } else {
-                Code::Enter
-            }
-        }
-        VK_SPACE => Code::Space,
-        VK_TAB => Code::Tab,
-        VK_BACK => Code::Backspace,
+    if e0 {
+        return match scan_code {
+            0x1C => Code::NumpadEnter,
+            0x1D => Code::ControlRight,
+            0x35 => Code::NumpadDivide,
+            0x37 => Code::PrintScreen,
+            0x38 => Code::AltRight,
+            0x47 => Code::Home,
+            0x48 => Code::ArrowUp,
+            0x49 => Code::PageUp,
+            0x4B => Code::ArrowLeft,
+            0x4D => Code::ArrowRight,
+            0x4F => Code::End,
+            0x50 => Code::ArrowDown,
+            0x51 => Code::PageDown,
+            0x52 => Code::Insert,
+            0x53 => Code::Delete,
+            0x5D => Code::ContextMenu,
+            _ => scan_code_to_base_code(scan_code),
+        };
+    }
 
-        VK_LSHIFT => Code::ShiftLeft,
-        VK_RSHIFT => Code::ShiftRight,
-        VK_LCONTROL => Code::ControlLeft,
-        VK_RCONTROL => Code::ControlRight,
-        VK_LMENU => Code::AltLeft,
-        VK_RMENU => Code::AltRight,
-        VK_LWIN => Code::MetaLeft,
-        VK_RWIN => Code::MetaRight,
-        VK_SHIFT => {
-            if scancode == 0x36 {
-                Code::ShiftRight
-            } else {
-                Code::ShiftLeft
-            }
-        }
-        VK_CONTROL => {
-            if is_e0 {
-                Code::ControlRight
-            } else {
-                Code::ControlLeft
-            }
-        }
-        VK_MENU => {
-            if is_e0 {
-                Code::AltRight
-            } else {
-                Code::AltLeft
-            }
-        }
+    scan_code_to_base_code(scan_code)
+}
 
-        VK_CAPITAL => Code::CapsLock,
-        VK_NUMLOCK => Code::NumLock,
-        VK_SCROLL => Code::ScrollLock,
-
-        VK_OEM_1 => Code::Semicolon,
-        VK_OEM_PLUS => Code::Equal,
-        VK_OEM_COMMA => Code::Comma,
-        VK_OEM_MINUS => Code::Minus,
-        VK_OEM_PERIOD => Code::Period,
-        VK_OEM_2 => Code::Slash,
-        VK_OEM_3 => Code::Backquote,
-        VK_OEM_4 => Code::BracketLeft,
-        VK_OEM_5 => Code::Backslash,
-        VK_OEM_6 => Code::BracketRight,
-        VK_OEM_7 => Code::Quote,
-
-        VK_NUMPAD0 => Code::Numpad0,
-        VK_NUMPAD1 => Code::Numpad1,
-        VK_NUMPAD2 => Code::Numpad2,
-        VK_NUMPAD3 => Code::Numpad3,
-        VK_NUMPAD4 => Code::Numpad4,
-        VK_NUMPAD5 => Code::Numpad5,
-        VK_NUMPAD6 => Code::Numpad6,
-        VK_NUMPAD7 => Code::Numpad7,
-        VK_NUMPAD8 => Code::Numpad8,
-        VK_NUMPAD9 => Code::Numpad9,
-        VK_MULTIPLY => Code::NumpadMultiply,
-        VK_ADD => Code::NumpadAdd,
-        VK_SUBTRACT => Code::NumpadSubtract,
-        VK_DECIMAL => Code::NumpadDecimal,
-        VK_DIVIDE => Code::NumpadDivide,
-
-        VK_PRIOR => Code::PageUp,
-        VK_NEXT => Code::PageDown,
-        VK_END => Code::End,
-        VK_HOME => Code::Home,
-        VK_LEFT => Code::ArrowLeft,
-        VK_UP => Code::ArrowUp,
-        VK_RIGHT => Code::ArrowRight,
-        VK_DOWN => Code::ArrowDown,
-        VK_INSERT => Code::Insert,
-        VK_DELETE => Code::Delete,
-
-        VK_SNAPSHOT => Code::PrintScreen,
-        VK_PAUSE => Code::Pause,
-        VK_APPS => Code::ContextMenu,
-
-        VK_F1 => Code::F1,
-        VK_F2 => Code::F2,
-        VK_F3 => Code::F3,
-        VK_F4 => Code::F4,
-        VK_F5 => Code::F5,
-        VK_F6 => Code::F6,
-        VK_F7 => Code::F7,
-        VK_F8 => Code::F8,
-        VK_F9 => Code::F9,
-        VK_F10 => Code::F10,
-        VK_F11 => Code::F11,
-        VK_F12 => Code::F12,
-        VK_F13 => Code::F13,
-        VK_F14 => Code::F14,
-        VK_F15 => Code::F15,
-        VK_F16 => Code::F16,
-        VK_F17 => Code::F17,
-        VK_F18 => Code::F18,
-        VK_F19 => Code::F19,
-        VK_F20 => Code::F20,
-        VK_F21 => Code::F21,
-        VK_F22 => Code::F22,
-        VK_F23 => Code::F23,
-        VK_F24 => Code::F24,
-
+fn scan_code_to_base_code(scan_code: u16) -> Code {
+    match scan_code {
+        0x01 => Code::Escape,
+        0x02 => Code::Digit1,
+        0x03 => Code::Digit2,
+        0x04 => Code::Digit3,
+        0x05 => Code::Digit4,
+        0x06 => Code::Digit5,
+        0x07 => Code::Digit6,
+        0x08 => Code::Digit7,
+        0x09 => Code::Digit8,
+        0x0A => Code::Digit9,
+        0x0B => Code::Digit0,
+        0x0C => Code::Minus,
+        0x0D => Code::Equal,
+        0x0E => Code::Backspace,
+        0x0F => Code::Tab,
+        0x10 => Code::KeyQ,
+        0x11 => Code::KeyW,
+        0x12 => Code::KeyE,
+        0x13 => Code::KeyR,
+        0x14 => Code::KeyT,
+        0x15 => Code::KeyY,
+        0x16 => Code::KeyU,
+        0x17 => Code::KeyI,
+        0x18 => Code::KeyO,
+        0x19 => Code::KeyP,
+        0x1A => Code::BracketLeft,
+        0x1B => Code::BracketRight,
+        0x1C => Code::Enter,
+        0x1D => Code::ControlLeft,
+        0x1E => Code::KeyA,
+        0x1F => Code::KeyS,
+        0x20 => Code::KeyD,
+        0x21 => Code::KeyF,
+        0x22 => Code::KeyG,
+        0x23 => Code::KeyH,
+        0x24 => Code::KeyJ,
+        0x25 => Code::KeyK,
+        0x26 => Code::KeyL,
+        0x27 => Code::Semicolon,
+        0x28 => Code::Quote,
+        0x29 => Code::Backquote,
+        0x2A => Code::ShiftLeft,
+        0x2B => Code::Backslash,
+        0x2C => Code::KeyZ,
+        0x2D => Code::KeyX,
+        0x2E => Code::KeyC,
+        0x2F => Code::KeyV,
+        0x30 => Code::KeyB,
+        0x31 => Code::KeyN,
+        0x32 => Code::KeyM,
+        0x33 => Code::Comma,
+        0x34 => Code::Period,
+        0x35 => Code::Slash,
+        0x36 => Code::ShiftRight,
+        0x37 => Code::NumpadMultiply,
+        0x38 => Code::AltLeft,
+        0x39 => Code::Space,
+        0x3A => Code::CapsLock,
+        0x3B => Code::F1,
+        0x3C => Code::F2,
+        0x3D => Code::F3,
+        0x3E => Code::F4,
+        0x3F => Code::F5,
+        0x40 => Code::F6,
+        0x41 => Code::F7,
+        0x42 => Code::F8,
+        0x43 => Code::F9,
+        0x44 => Code::F10,
+        0x45 => Code::NumLock,
+        0x46 => Code::ScrollLock,
+        0x47 => Code::Numpad7,
+        0x48 => Code::Numpad8,
+        0x49 => Code::Numpad9,
+        0x4A => Code::NumpadSubtract,
+        0x4B => Code::Numpad4,
+        0x4C => Code::Numpad5,
+        0x4D => Code::Numpad6,
+        0x4E => Code::NumpadAdd,
+        0x4F => Code::Numpad1,
+        0x50 => Code::Numpad2,
+        0x51 => Code::Numpad3,
+        0x52 => Code::Numpad0,
+        0x53 => Code::NumpadDecimal,
+        0x54 => Code::PrintScreen,
+        0x56 => Code::IntlBackslash,
+        0x57 => Code::F11,
+        0x58 => Code::F12,
+        0x5A => Code::IntlYen,
+        0x5B => Code::IntlRo,
+        0x5C => Code::KanaMode,
+        0x5D => Code::KanaMode,
+        0x64 => Code::F13,
+        0x65 => Code::F14,
+        0x66 => Code::F15,
+        0x67 => Code::F16,
+        0x68 => Code::F17,
+        0x69 => Code::F18,
+        0x6A => Code::F19,
+        0x6B => Code::F20,
+        0x6C => Code::F21,
+        0x6D => Code::F22,
+        0x6E => Code::F23,
+        0x6F => Code::Unidentified,
+        0x70 => Code::Katakana,
+        0x71 => Code::Unidentified,
+        0x76 => Code::F24,
+        0x77 => Code::Unidentified,
+        0x79 => Code::Convert,
+        0x7B => Code::NonConvert,
         _ => Code::Unidentified,
     }
 }
 
-pub fn raw_to_location(vkey: VIRTUAL_KEY, is_e0: bool) -> Location {
-    match vkey {
-        VK_LSHIFT | VK_LCONTROL | VK_LMENU | VK_LWIN => Location::Left,
-        VK_RSHIFT | VK_RCONTROL | VK_RMENU | VK_RWIN => Location::Right,
-        VK_CONTROL | VK_MENU => {
-            if is_e0 {
-                Location::Right
-            } else {
-                Location::Left
-            }
-        }
-        VK_NUMPAD0 | VK_NUMPAD1 | VK_NUMPAD2 | VK_NUMPAD3 | VK_NUMPAD4 | VK_NUMPAD5
-        | VK_NUMPAD6 | VK_NUMPAD7 | VK_NUMPAD8 | VK_NUMPAD9 | VK_MULTIPLY | VK_ADD
-        | VK_SUBTRACT | VK_DECIMAL | VK_DIVIDE => Location::Numpad,
-        VK_RETURN if is_e0 => Location::Numpad,
+fn scan_code_to_location(code: ScanCode, state: KeyState) -> Location {
+    let scan_code = code as u16;
+    let e0 = state.contains(KeyState::E0);
+
+    match scan_code {
+        0x2A => Location::Left,
+        0x36 => Location::Right,
+        0x1D if e0 => Location::Right,
+        0x1D => Location::Left,
+        0x38 if e0 => Location::Right,
+        0x38 => Location::Left,
+        0x47..=0x53 if !e0 => Location::Numpad,
+        0x1C if e0 => Location::Numpad,
+        0x35 if e0 => Location::Numpad,
+        0x37 if !e0 => Location::Numpad,
+        0x4A if !e0 => Location::Numpad,
+        0x4E if !e0 => Location::Numpad,
         _ => Location::Standard,
     }
 }
 
-pub fn raw_to_key(vkey: VIRTUAL_KEY) -> Key {
-    let named_key = match vkey {
-        VK_ESCAPE => Some(NamedKey::Escape),
-        VK_RETURN => Some(NamedKey::Enter),
-        VK_TAB => Some(NamedKey::Tab),
-        VK_BACK => Some(NamedKey::Backspace),
-        VK_DELETE => Some(NamedKey::Delete),
-        VK_INSERT => Some(NamedKey::Insert),
+pub(crate) fn modifier_for_key(code: ScanCode, state: KeyState) -> Option<Modifiers> {
+    let scan_code = code as u16;
+    let e0 = state.contains(KeyState::E0);
 
-        VK_HOME => Some(NamedKey::Home),
-        VK_END => Some(NamedKey::End),
-        VK_PRIOR => Some(NamedKey::PageUp),
-        VK_NEXT => Some(NamedKey::PageDown),
-
-        VK_UP => Some(NamedKey::ArrowUp),
-        VK_DOWN => Some(NamedKey::ArrowDown),
-        VK_LEFT => Some(NamedKey::ArrowLeft),
-        VK_RIGHT => Some(NamedKey::ArrowRight),
-
-        VK_CAPITAL => Some(NamedKey::CapsLock),
-        VK_NUMLOCK => Some(NamedKey::NumLock),
-        VK_SCROLL => Some(NamedKey::ScrollLock),
-
-        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(NamedKey::Shift),
-        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => Some(NamedKey::Control),
-        VK_MENU | VK_LMENU | VK_RMENU => Some(NamedKey::Alt),
-        VK_LWIN | VK_RWIN => Some(NamedKey::Meta),
-
-        VK_SNAPSHOT => Some(NamedKey::PrintScreen),
-        VK_PAUSE => Some(NamedKey::Pause),
-        VK_APPS => Some(NamedKey::ContextMenu),
-
-        VK_F1 => Some(NamedKey::F1),
-        VK_F2 => Some(NamedKey::F2),
-        VK_F3 => Some(NamedKey::F3),
-        VK_F4 => Some(NamedKey::F4),
-        VK_F5 => Some(NamedKey::F5),
-        VK_F6 => Some(NamedKey::F6),
-        VK_F7 => Some(NamedKey::F7),
-        VK_F8 => Some(NamedKey::F8),
-        VK_F9 => Some(NamedKey::F9),
-        VK_F10 => Some(NamedKey::F10),
-        VK_F11 => Some(NamedKey::F11),
-        VK_F12 => Some(NamedKey::F12),
-        VK_F13 => Some(NamedKey::F13),
-        VK_F14 => Some(NamedKey::F14),
-        VK_F15 => Some(NamedKey::F15),
-        VK_F16 => Some(NamedKey::F16),
-        VK_F17 => Some(NamedKey::F17),
-        VK_F18 => Some(NamedKey::F18),
-        VK_F19 => Some(NamedKey::F19),
-        VK_F20 => Some(NamedKey::F20),
-        VK_F21 => Some(NamedKey::F21),
-        VK_F22 => Some(NamedKey::F22),
-        VK_F23 => Some(NamedKey::F23),
-        VK_F24 => Some(NamedKey::F24),
-
-        _ => None,
-    };
-
-    match named_key {
-        Some(key) => Key::Named(key),
-        None => Key::Named(NamedKey::Unidentified),
-    }
-}
-
-pub fn modifier_for_key(vkey: VIRTUAL_KEY, is_e0: bool) -> Option<Modifiers> {
-    match vkey {
-        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(Modifiers::SHIFT),
-        VK_CONTROL | VK_LCONTROL => Some(Modifiers::CONTROL),
-        VK_RCONTROL => Some(Modifiers::CONTROL),
-        VK_LMENU => Some(Modifiers::ALT),
-        VK_RMENU => Some(Modifiers::ALT_GRAPH),
-        VK_MENU => {
-            if is_e0 {
+    match scan_code {
+        0x2A | 0x36 => Some(Modifiers::SHIFT),
+        0x1D => Some(Modifiers::CONTROL),
+        0x38 => {
+            if e0 {
                 Some(Modifiers::ALT_GRAPH)
             } else {
                 Some(Modifiers::ALT)
             }
         }
-        VK_LWIN | VK_RWIN => Some(Modifiers::META),
-        VK_CAPITAL => Some(Modifiers::CAPS_LOCK),
-        VK_NUMLOCK => Some(Modifiers::NUM_LOCK),
-        VK_SCROLL => Some(Modifiers::SCROLL_LOCK),
+        0x5B | 0x5C if e0 => Some(Modifiers::META),
+        0x3A => Some(Modifiers::CAPS_LOCK),
+        0x45 => Some(Modifiers::NUM_LOCK),
+        0x46 => Some(Modifiers::SCROLL_LOCK),
         _ => None,
     }
 }
