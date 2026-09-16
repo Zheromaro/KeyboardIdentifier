@@ -67,13 +67,12 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
     /// Registers a callback to be executed when any key action (press or release)
     /// occurs on any tracked keyboard.
     ///
-    ///
     /// Multiple callbacks can be registered. They will be executed sequentially
-    /// when a `Pressed` event is received.
+    /// when a `KeyEvent` is received.
     ///
     /// This provides the full [`keyboard_types::KeyboardEvent`], allowing access to
     /// the logical key, physical code, modifiers, location, repeat state, and more.
-    pub fn on_pressed<F>(&self, callback: F)
+    pub fn on_key_action<F>(&self, callback: F)
     where
         F: Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static,
     {

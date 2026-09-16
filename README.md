@@ -1,15 +1,16 @@
-# keyboard_identifier
+# Keyboard Identifier
 
-A cross-platform Rust library for uniquely identifying physical keyboards, tracking their hardware ports, and listening to device-specific events (key presses, plug, and unplug events). 
+A cross-platform Rust library for uniquely identifying physical keyboards, tracking their hardware ports, and listening to device-specific events (key presses, releases, plug, and unplug events). 
 
-Built with `tokio`, this library abstracts away OS-specific input APIs (Raw Input / SetupAPI on Windows, standard inputs on Linux) to provide a unified, asynchronous event-driven interface. Perfect for projects involving custom macro pads, POS systems, or multi-keyboard setups.
+Built with `tokio`, this library abstracts away OS-specific input APIs to provide a unified, asynchronous event-driven interface. Perfect for projects involving custom macro pads, POS systems, or multi-keyboard setups.
 
 ## Features
 
 * **Device Differentiation:** Identify keyboards by Vendor ID, Product ID, Serial Number, and Name.
 * **Topology Tracking:** Differentiate identical keyboards plugged into different USB ports using `PortID` (physical path).
-* **Async Event Callbacks:** Listen to `Pressed`, `Plugged`, and `Unplugged` events non-blocking via Tokio.
-* **Cross-Platform:** Native support for Windows and Linux.
+* **Async Event Callbacks:** Listen to `KeyAction` (press/release), `Plugged`, and `Unplugged` events non-blocking via Tokio.
+* **Rich Key Events:** Integrates the external W3C standard using the `keyboard-types` crate to provide detailed key event data (logical key, physical code, modifiers, and repeat state)[cite: 1, 3].
+* **Cross-Platform:** Native support for Windows, Linux, and macOS.
 
 ## Installation
 
@@ -26,16 +27,13 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "rt-multi-thre
 This example demonstrates how to list available keyboards, ask the user to press a key to "select" a specific keyboard, and then monitor events specifically for that device.
 
 ```rust,no_run
-use keyboard_identifier::{KeyboardManager, keyboard_source::*};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use keyboard_identifier::{KeyEvent, Keyboard, KeyboardManager};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize the manager and list currently connected keyboards
-    let mut manager = KeyboardManager::new().await?;
+    // 1. List available keyboards (informational only)
+    let mut manager = KeyboardManager::new().await.unwrap();
     let keyboards = manager.get_keyboards();
-    
     if keyboards.is_empty() {
         println!("No keyboards found.");
         return Ok(());
@@ -43,49 +41,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Available keyboards:");
     for (i, kb) in keyboards.iter().enumerate() {
-        println!(" [{}] ID: {:?} | Port: {:?}", i, kb.keyboard_id.name, kb.port_id.physical_path);
+        println!("{}.\n     {},\n     {}", i, kb.keyboard_id, kb.port_id);
     }
 
-    // 2. Set up a single channel to route all keyboard events to our main loop
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    // 2. Assigning events
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let tx_pressed = tx.clone();
-    manager.on_pressed(move |kb| { let _ = tx_pressed.send(KeyboardEvent::Pressed(Arc::new(kb.clone()))); });
+    manager.on_key_action(move |kb: &Keyboard, ke: &KeyEvent| {
+        let name = kb.keyboard_id.name.as_deref().unwrap_or("Unknown Keyboard");
+        let _ = tx_pressed.send(format!("Pressed: {name}\nEvent: {:?}", ke));
+    });
 
     let tx_plugged = tx.clone();
-    manager.on_plugged(move |kb| { let _ = tx_plugged.send(KeyboardEvent::Plugged(Arc::new(kb.clone()))); });
+    manager.on_plugged(move |kb: &Keyboard| {
+        let _ = tx_plugged.send(format!(
+            "Plugged: \n     {},\n     {}",
+            kb.keyboard_id, kb.port_id
+        ));
+    });
 
     let tx_unplugged = tx.clone();
-    manager.on_unplugged(move |kb| { let _ = tx_unplugged.send(KeyboardEvent::Unplugged(Arc::new(kb.clone()))); });
+    manager.on_unplugged(move |kb: &Keyboard| {
+        let _ = tx_unplugged.send(format!(
+            "Unplugged: \n     {},\n     {}",
+            kb.keyboard_id, kb.port_id
+        ));
+    });
 
-    // Start background listening
     manager.listen().await;
+    println!("Now listening for events. Press Ctrl+C to quit.");
 
-    // 3. Main Event Loop (Selection & Monitoring)
-    println!("\nPress any key on the keyboard you want to monitor...");
-    let mut selected_keyboard = None;
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            KeyboardEvent::Pressed(kb) => {
-                // If we haven't selected a keyboard yet, the first one to press a key wins
-                if selected_keyboard.is_none() {
-                    selected_keyboard = Some(kb.clone());
-                    println!("\n✅ Selected keyboard: {:?}", kb.keyboard_id.name);
-                    println!("Now listening for events on the selected keyboard. Press Ctrl+C to quit.");
-                } 
-                // If a keyboard is already selected, only log presses for that specific keyboard
-                else if Some(&kb) == selected_keyboard.as_ref() {
-                    println!("⌨️ Key pressed on selected keyboard!");
-                }
-            }
-            KeyboardEvent::Plugged(kb) => {
-                println!("🔌 Plugged: {:?} (Port: {:?})", kb.keyboard_id.name, kb.port_id.physical_path);
-            }
-            KeyboardEvent::Unplugged(kb) => {
-                println!("❌ Unplugged: {:?} (Port: {:?})", kb.keyboard_id.name, kb.port_id.physical_path);
-            }
-        }
+    // 3. Print each event as it arrives
+    while let Some(event_type) = rx.recv().await {
+        println!("{}", event_type);
     }
 
     Ok(())
@@ -101,16 +90,25 @@ The primary struct representing a connected device. It contains two identifiers:
 
 *Note: Two identical keyboards from the same manufacturer will have identical `KeyboardID`s, but different `PortID`s.*
 
-### `KeyboardEvent`
-An enum representing what happened to a keyboard:
-* `Plugged(Arc<Keyboard>)`
-* `Unplugged(Arc<Keyboard>)`
-* `Pressed(Arc<Keyboard>)`
+### `KeyEvent`
+A rename to KeyboardEvent struct from keyboard_types crate, found on : https://crates.io/crates/keyboard-types
+
+```rust,no_run
+pub struct KeyboardEvent {
+    pub state: KeyState,
+    pub key: Key,
+    pub code: Code,
+    pub location: Location,
+    pub modifiers: Modifiers,
+    /* … */
+}
+```
+although key field is not set
 
 ## Supported OS
 - **Windows** (`target_os = "windows"`): Uses Raw Input and SetupAPI.
 - **Linux** (`target_os = "linux"`): Uses standard input file descriptors.
-
+- **macOS** (`target_os = "macos"`): Native implementation using FFI and C callbacks[cite: 2].
 ## License
 
-This project is licensed under \[MIT\] - see the LICENSE file for details.
+This project is licensed under \[MIT\].

@@ -9,7 +9,7 @@ async fn test_no_press() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx.send(());
     });
     listener.listen().await;
@@ -26,7 +26,7 @@ async fn test_other_keyboard_press_one_job() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |kb, _| {
+    listener.on_key_action(move |kb, _| {
         if kb.keyboard_id == keyboard.keyboard_id {
             let _ = tx.send(());
         }
@@ -46,7 +46,7 @@ async fn test_one_press_one_job() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx.send(());
     });
     listener.listen().await;
@@ -63,7 +63,7 @@ async fn test_two_presses_one_job() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx.send(());
     });
     listener.listen().await;
@@ -87,14 +87,14 @@ async fn test_one_press_two_jobs() {
 
     let target_id = keyboard.keyboard_id.clone();
     let tx1 = tx.clone();
-    listener.on_pressed(move |kb, _| {
+    listener.on_key_action(move |kb, _| {
         if kb.keyboard_id == target_id {
             let _ = tx1.send("job1");
         }
     });
 
     let tx2 = tx.clone();
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx2.send("job2");
     });
 
@@ -117,12 +117,12 @@ async fn test_two_presses_two_jobs() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     let tx1 = tx.clone();
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx1.send("job1");
     });
 
     let tx2 = tx.clone();
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx2.send("job2");
     });
 
@@ -149,7 +149,7 @@ async fn test_release_triggers_callback_with_up_state() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |_, event| {
+    listener.on_key_action(move |_, event| {
         let _ = tx.send(event.state);
     });
     listener.listen().await;
@@ -168,7 +168,7 @@ async fn test_key_event_data() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |_, event| {
+    listener.on_key_action(move |_, event| {
         let _ = tx.send((event.key.clone(), event.code, event.state));
     });
     listener.listen().await;
@@ -190,7 +190,7 @@ async fn test_press_after_unplug_no_event() {
     let mut listener = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx.send(());
     });
     listener.listen().await;

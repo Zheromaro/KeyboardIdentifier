@@ -15,7 +15,7 @@ async fn test_listen_routes_all_events() {
     });
 
     let tx_pressed = tx.clone();
-    listener.on_pressed(move |_, _| {
+    listener.on_key_action(move |_, _| {
         let _ = tx_pressed.send("pressed");
     });
 

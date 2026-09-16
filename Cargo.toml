@@ -1,6 +1,6 @@
 [package]
 name = "keyboard_identifier"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "Async keyboard enumeration and hotplug events for Linux, Windows, and macOS"
@@ -13,7 +13,7 @@ categories = ["hardware-support", "os::linux-apis", "os::windows-apis"]
 
 
 [package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
 
 [dependencies]
 keyboard-types = "0.8.3"
