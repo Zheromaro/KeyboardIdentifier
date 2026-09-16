@@ -5,11 +5,13 @@ mod window;
 use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource};
 use std::{
     io,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{mpsc, oneshot};
 use window::InputThread;
-
 
 pub(crate) fn win32_error(message: &'static str) -> io::Error {
     let code = unsafe { windows::Win32::Foundation::GetLastError().0 as i32 };
@@ -86,7 +88,6 @@ impl KeyboardSource for WindowsKeyboardSource {
                 ));
             }
         }
-
         Ok(Self {
             events: event_rx,
             _owner: owner,
@@ -96,10 +97,11 @@ impl KeyboardSource for WindowsKeyboardSource {
     }
 
     fn enumerate_keyboards(&self) -> Vec<Keyboard> {
+        // FIXED: Recover from poisoned lock instead of silently returning empty vector
         self.keyboards
             .read()
-            .map(|keyboards| keyboards.clone())
-            .unwrap_or_default()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     async fn receive_event(&mut self) -> io::Result<KeyboardEvent> {
@@ -114,33 +116,41 @@ impl KeyboardSource for WindowsKeyboardSource {
 
     async fn consume(&mut self, keyboard: &Keyboard) -> io::Result<()> {
         let thread = self.thread.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "Windows keyboard input thread exited")
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Windows keyboard input thread exited",
+            )
         })?;
         let (reply_tx, reply_rx) = oneshot::channel();
-
         thread.send_command(InterceptionCommand::Consume {
             keyboard: keyboard.clone(),
             reply: reply_tx,
         })?;
-
         reply_rx.await.map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "Windows keyboard input thread exited")
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Windows keyboard input thread exited",
+            )
         })?
     }
 
     async fn release(&mut self, keyboard: &Keyboard) -> io::Result<()> {
         let thread = self.thread.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "Windows keyboard input thread exited")
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Windows keyboard input thread exited",
+            )
         })?;
         let (reply_tx, reply_rx) = oneshot::channel();
-
         thread.send_command(InterceptionCommand::Release {
             keyboard: keyboard.clone(),
             reply: reply_tx,
         })?;
-
         reply_rx.await.map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "Windows keyboard input thread exited")
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Windows keyboard input thread exited",
+            )
         })?
     }
 }

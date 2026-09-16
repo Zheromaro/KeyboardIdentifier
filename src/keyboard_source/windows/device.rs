@@ -1,6 +1,6 @@
 use crate::keyboard_source::{Keyboard, KeyboardID, PortID};
 use interception::{Device as InterceptionDevice, Interception};
-use std::{io, mem::size_of};
+use std::{collections::HashMap, io, mem::size_of};
 use windows::Win32::{
     Devices::{
         DeviceAndDriverInstallation::{
@@ -17,8 +17,10 @@ use windows::Win32::{
     },
     Foundation::{CloseHandle, HANDLE},
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
-    UI::Input::{RIM_TYPEKEYBOARD, GetRawInputDeviceInfoW, GetRawInputDeviceList,
-        RAWINPUTDEVICELIST, RIDI_DEVICENAME},
+    UI::Input::{
+        GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICENAME,
+        RIM_TYPEKEYBOARD,
+    },
 };
 use windows::core::PCWSTR;
 
@@ -44,11 +46,6 @@ impl Drop for OwnedHandle {
 pub(crate) struct DeviceEnumerator;
 
 impl DeviceEnumerator {
-    /// Enumerates keyboards known to the Windows Raw Input subsystem and matches
-    /// them to Interception device slots using VID/PID/serial information.
-    ///
-    /// Raw Input is used only for device metadata; keyboard events themselves
-    /// are handled by Interception.
     pub(crate) fn enumerate_keyboards(
         interception: &Interception,
     ) -> io::Result<Vec<DiscoveredKeyboard>> {
@@ -59,23 +56,19 @@ impl DeviceEnumerator {
             if !interception::is_keyboard(device) {
                 continue;
             }
-
             let Some(hardware_id) = Self::hardware_id(interception, device) else {
                 continue;
             };
-
             let keyboard = raw_keyboards
                 .iter()
                 .find(|keyboard| Self::matches_hardware_id(&keyboard.keyboard, &hardware_id))
                 .map(|keyboard| keyboard.keyboard.clone())
                 .unwrap_or_else(|| Self::keyboard_from_hardware_id(&hardware_id));
-
             result.push(DiscoveredKeyboard {
                 handle: DeviceHandle(device),
                 keyboard,
             });
         }
-
         Ok(result)
     }
 
@@ -88,10 +81,11 @@ impl DeviceEnumerator {
         if length == 0 || length > buffer.len() {
             return None;
         }
-
-        Some(String::from_utf8_lossy(&buffer[..length])
-            .trim_end_matches('\0')
-            .to_owned())
+        Some(
+            String::from_utf8_lossy(&buffer[..length])
+                .trim_end_matches('\0')
+                .to_owned(),
+        )
     }
 
     fn enumerate_raw_keyboards() -> io::Result<Vec<DiscoveredKeyboardMetadata>> {
@@ -102,7 +96,6 @@ impl DeviceEnumerator {
         {
             return Err(super::win32_error("GetRawInputDeviceList(size) failed"));
         }
-
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -119,20 +112,26 @@ impl DeviceEnumerator {
             return Err(super::win32_error("GetRawInputDeviceList(data) failed"));
         }
 
+        // FIXED: Build the device path map ONCE per refresh cycle instead of per keyboard
+        let path_map = Self::build_device_path_map()?;
+
         Ok(devices
             .into_iter()
             .filter(|device| device.dwType == RIM_TYPEKEYBOARD)
             .filter_map(|device| {
-                let keyboard = Self::keyboard_from_raw_handle(device.hDevice)?;
+                let keyboard = Self::keyboard_from_raw_handle(device.hDevice, &path_map)?;
                 Some(DiscoveredKeyboardMetadata { keyboard })
             })
             .collect())
     }
 
-    fn keyboard_from_raw_handle(handle: HANDLE) -> Option<Keyboard> {
+    // FIXED: Accept pre-built map for O(1) lookup
+    fn keyboard_from_raw_handle(
+        handle: HANDLE,
+        path_map: &HashMap<String, String>,
+    ) -> Option<Keyboard> {
         let path = Self::device_name(handle).ok()?;
         let hardware_id = path.split('#').nth(1).unwrap_or_default();
-
         let mut keyboard = Keyboard {
             keyboard_id: KeyboardID {
                 name: None,
@@ -141,10 +140,9 @@ impl DeviceEnumerator {
                 serial: None,
             },
             port_id: PortID {
-                physical_path: Self::physical_path(&path),
+                physical_path: path_map.get(&path).cloned(),
             },
         };
-
         let (product, serial) = Self::hid_strings(&path);
         keyboard.keyboard_id.name = product;
         keyboard.keyboard_id.serial = serial;
@@ -199,12 +197,9 @@ impl DeviceEnumerator {
 
     fn device_name(handle: HANDLE) -> io::Result<String> {
         let mut size = 0u32;
-        if unsafe { GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, None, &mut size) }
-            == u32::MAX
-        {
+        if unsafe { GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, None, &mut size) } == u32::MAX {
             return Err(super::win32_error("GetRawInputDeviceInfoW(size) failed"));
         }
-
         let mut buffer = vec![0u16; size as usize + 1];
         let mut actual_size = buffer.len() as u32;
         if unsafe {
@@ -218,24 +213,24 @@ impl DeviceEnumerator {
         {
             return Err(super::win32_error("GetRawInputDeviceInfoW(data) failed"));
         }
-
-        Ok(String::from_utf16_lossy(&buffer[..actual_size.min(buffer.len() as u32) as usize])
-            .trim_end_matches('\0')
-            .to_owned())
+        Ok(
+            String::from_utf16_lossy(&buffer[..actual_size.min(buffer.len() as u32) as usize])
+                .trim_end_matches('\0')
+                .to_owned(),
+        )
     }
 
     fn extract_hex(value: &str, prefix: &str) -> Option<String> {
         let upper = value.to_ascii_uppercase();
         let start = upper.find(prefix)?;
-        let value = &value[start + prefix.len()..];
-        let end = value
+        let val = &value[start + prefix.len()..];
+        let end = val
             .find(|character: char| !character.is_ascii_hexdigit())
-            .unwrap_or(value.len());
-
+            .unwrap_or(val.len());
         if end == 0 {
             None
         } else {
-            u16::from_str_radix(&value[..end], 16)
+            u16::from_str_radix(&val[..end], 16)
                 .ok()
                 .map(|id| format!("{id:04x}"))
         }
@@ -246,7 +241,6 @@ impl DeviceEnumerator {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path.as_ptr()),
@@ -258,33 +252,40 @@ impl DeviceEnumerator {
                 HANDLE(std::ptr::null_mut()),
             )
         };
-
         let Ok(handle) = handle else {
             return (None, None);
         };
         if handle.is_invalid() {
             return (None, None);
         }
-
         let handle = OwnedHandle(handle);
         let mut product = [0u16; 256];
         let mut serial = [0u16; 256];
 
         let product = unsafe { HidD_GetProductString(handle.0, product.as_mut_ptr().cast(), 512) }
             .as_bool()
-            .then(|| String::from_utf16_lossy(&product).trim_end_matches('\0').to_owned());
+            .then(|| {
+                String::from_utf16_lossy(&product)
+                    .trim_end_matches('\0')
+                    .to_owned()
+            });
 
-        let serial = unsafe {
-            HidD_GetSerialNumberString(handle.0, serial.as_mut_ptr().cast(), 512)
-        }
-        .as_bool()
-        .then(|| String::from_utf16_lossy(&serial).trim_end_matches('\0').to_owned())
-        .filter(|value| !value.is_empty());
+        let serial =
+            unsafe { HidD_GetSerialNumberString(handle.0, serial.as_mut_ptr().cast(), 512) }
+                .as_bool()
+                .then(|| {
+                    String::from_utf16_lossy(&serial)
+                        .trim_end_matches('\0')
+                        .to_owned()
+                })
+                .filter(|value| !value.is_empty());
 
         (product, serial)
     }
 
-    fn physical_path(target_path: &str) -> Option<String> {
+    // FIXED: Replaced per-keyboard `physical_path` scan with a single batched map builder
+    fn build_device_path_map() -> io::Result<HashMap<String, String>> {
+        let mut map = HashMap::new();
         let guid = windows::core::GUID::from_values(
             0x4D1E55B2,
             0xF16F,
@@ -300,19 +301,28 @@ impl DeviceEnumerator {
                 DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
             )
         }
-        .ok()?;
+        .map_err(|_| super::win32_error("SetupDiGetClassDevsW failed"))?;
+
+        struct DevInfoGuard(HDEVINFO);
+        impl Drop for DevInfoGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetupDiDestroyDeviceInfoList(self.0);
+                }
+            }
+        }
+        let _guard = DevInfoGuard(handle);
 
         let mut index = 0u32;
-        let result = loop {
+        loop {
             let mut iface_data = SP_DEVICE_INTERFACE_DATA {
                 cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
                 ..Default::default()
             };
-
             if unsafe { SetupDiEnumDeviceInterfaces(handle, None, &guid, index, &mut iface_data) }
                 .is_err()
             {
-                break None;
+                break;
             }
 
             let mut required_size = 0u32;
@@ -327,12 +337,16 @@ impl DeviceEnumerator {
                 );
             }
 
+            if required_size == 0 {
+                index += 1;
+                continue;
+            }
+
             let mut detail_buf = vec![0u8; required_size as usize];
             let detail_data = detail_buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
             unsafe {
                 (*detail_data).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
             }
-
             let mut dev_info = SP_DEVINFO_DATA {
                 cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
                 ..Default::default()
@@ -356,33 +370,25 @@ impl DeviceEnumerator {
                         .unwrap_or_default()
                 };
 
-                if path.eq_ignore_ascii_case(target_path) {
-                    if let Some(location) = Self::query_prop(
-                        handle,
-                        &dev_info,
-                        &DEVPKEY_Device_LocationPaths,
-                        DEVPROP_TYPE_STRING_LIST,
-                    ) {
-                        break Some(location);
-                    }
-
-                    break Self::query_prop(
-                        handle,
-                        &dev_info,
-                        &DEVPKEY_Device_InstanceId,
-                        DEVPROP_TYPE_STRING,
-                    );
+                if let Some(location) = Self::query_prop(
+                    handle,
+                    &dev_info,
+                    &DEVPKEY_Device_LocationPaths,
+                    DEVPROP_TYPE_STRING_LIST,
+                ) {
+                    map.insert(path, location);
+                } else if let Some(instance) = Self::query_prop(
+                    handle,
+                    &dev_info,
+                    &DEVPKEY_Device_InstanceId,
+                    DEVPROP_TYPE_STRING,
+                ) {
+                    map.insert(path, instance);
                 }
             }
-
             index += 1;
-        };
-
-        unsafe {
-            let _ = SetupDiDestroyDeviceInfoList(handle);
         }
-
-        result
+        Ok(map)
     }
 
     fn query_prop(
@@ -404,11 +410,9 @@ impl DeviceEnumerator {
                 0,
             );
         }
-
         if size == 0 || property_type != expected_type {
             return None;
         }
-
         let mut buffer = vec![0u8; size as usize];
         unsafe {
             SetupDiGetDevicePropertyW(
@@ -427,8 +431,13 @@ impl DeviceEnumerator {
             .chunks_exact(2)
             .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
             .collect();
-        let len = values.iter().position(|&value| value == 0).unwrap_or(values.len());
-        (len != 0).then(|| String::from_utf16(&values[..len]).ok()).flatten()
+        let len = values
+            .iter()
+            .position(|&value| value == 0)
+            .unwrap_or(values.len());
+        (len != 0)
+            .then(|| String::from_utf16(&values[..len]).ok())
+            .flatten()
     }
 }
 

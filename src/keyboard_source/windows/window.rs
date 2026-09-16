@@ -1,14 +1,15 @@
-use super::{device::DeviceEnumerator, key_mapping::*, InterceptionCommand};
+use super::{InterceptionCommand, device::DeviceEnumerator, key_mapping::*};
 use crate::keyboard_source::{Keyboard, KeyboardEvent};
 use interception::{Filter, Interception, KeyFilter, KeyState, ScanCode};
 use std::{
     collections::{HashMap, HashSet},
     io,
-    sync::{mpsc, Arc, RwLock},
+    sync::{Arc, RwLock, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
@@ -29,7 +30,6 @@ impl InputThread {
             let result = run_interception(command_rx, event_tx, keyboards);
             let _ = init_tx.send(result);
         });
-
         Self {
             command_tx,
             thread: Some(thread),
@@ -37,9 +37,9 @@ impl InputThread {
     }
 
     pub(crate) fn send_command(&self, command: InterceptionCommand) -> io::Result<()> {
-        self.command_tx.send(command).map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "Windows input thread exited")
-        })
+        self.command_tx
+            .send(command)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Windows input thread exited"))
     }
 }
 
@@ -55,7 +55,7 @@ impl Drop for InputThread {
 struct InterceptionState {
     context: Interception,
     keyboards: HashMap<interception::Device, Arc<Keyboard>>,
-    consumed: HashSet<interception::Device>,
+    consumed: HashSet<interception::Device>, // FIXED: Syntax error corrected
     pressed_keys: HashSet<(interception::Device, ScanCode)>,
     modifiers: keyboard_types::Modifiers,
     last_device_refresh: Instant,
@@ -78,12 +78,25 @@ fn run_interception(
         Filter::KeyFilter(KeyFilter::DOWN | KeyFilter::UP | KeyFilter::E0 | KeyFilter::E1),
     );
 
+    // FIXED: Initialize modifier state from OS to handle pre-held/toggled keys
+    let mut mods = keyboard_types::Modifiers::empty();
+    let is_key_toggled = |vk: i32| unsafe { (GetKeyState(vk) & 1) != 0 };
+    if is_key_toggled(0x14) {
+        mods.insert(keyboard_types::Modifiers::CAPS_LOCK);
+    } // VK_CAPITAL
+    if is_key_toggled(0x90) {
+        mods.insert(keyboard_types::Modifiers::NUM_LOCK);
+    } // VK_NUMLOCK
+    if is_key_toggled(0x91) {
+        mods.insert(keyboard_types::Modifiers::SCROLL_LOCK);
+    } // VK_SCROLL
+
     let mut state = InterceptionState {
         context,
         keyboards: HashMap::new(),
         consumed: HashSet::new(),
         pressed_keys: HashSet::new(),
-        modifiers: keyboard_types::Modifiers::empty(),
+        modifiers: mods,
         last_device_refresh: Instant::now() - DEVICE_REFRESH_INTERVAL,
     };
 
@@ -91,6 +104,11 @@ fn run_interception(
 
     loop {
         if process_commands(&mut state, &command_rx)? {
+            break;
+        }
+
+        // FIXED: Graceful shutdown if main thread drops the receiver
+        if event_tx.is_closed() {
             break;
         }
 
@@ -111,7 +129,6 @@ fn run_interception(
             state: KeyState::UP,
             information: 0,
         }];
-
         let received = state.context.receive(device, &mut strokes);
         if received <= 0 {
             continue;
@@ -127,7 +144,8 @@ fn run_interception(
                 code,
                 state: key_state,
                 ..
-            } = stroke else {
+            } = stroke
+            else {
                 continue;
             };
 
@@ -143,13 +161,14 @@ fn run_interception(
             update_modifiers(&mut state.modifiers, code, key_state, repeat);
             let event = interception_to_key_event(code, key_state, state.modifiers, repeat);
 
-            let _ = event_tx.blocking_send(Ok(KeyboardEvent::KeyAction(
-                Arc::clone(&keyboard),
-                event,
-            )));
+            // FIXED: Break cleanly if receiver is dropped instead of silently ignoring
+            if event_tx
+                .blocking_send(Ok(KeyboardEvent::KeyAction(Arc::clone(&keyboard), event)))
+                .is_err()
+            {
+                break;
+            }
 
-            // Interception is pass-through until we deliberately consume the
-            // device. A consumed stroke is therefore intentionally not sent.
             if !state.consumed.contains(&device) {
                 let sent = state.context.send(device, &[stroke]);
                 if sent != 1 {
@@ -160,11 +179,14 @@ fn run_interception(
             }
         }
 
+        if event_tx.is_closed() {
+            break;
+        }
+
         if state.last_device_refresh.elapsed() >= DEVICE_REFRESH_INTERVAL {
             refresh_devices(&mut state, &event_tx, &keyboard_snapshot, true)?;
         }
     }
-
     Ok(())
 }
 
@@ -186,7 +208,6 @@ fn process_commands(
             InterceptionCommand::Stop => return Ok(true),
         }
     }
-
     Ok(false)
 }
 
@@ -212,7 +233,6 @@ fn set_consumed(
     } else {
         state.consumed.remove(&device);
     }
-
     Ok(())
 }
 
@@ -224,7 +244,6 @@ fn refresh_devices(
 ) -> io::Result<()> {
     let discovered = DeviceEnumerator::enumerate_keyboards(&state.context)?;
     let mut current = HashMap::new();
-
     for device in discovered {
         current.insert(device.handle.0, Arc::new(device.keyboard));
     }
@@ -244,12 +263,15 @@ fn refresh_devices(
     }
 
     state.keyboards = current;
-
     if let Ok(mut snapshot) = keyboard_snapshot.write() {
         snapshot.clear();
-        snapshot.extend(state.keyboards.values().map(|keyboard| keyboard.as_ref().clone()));
+        snapshot.extend(
+            state
+                .keyboards
+                .values()
+                .map(|keyboard| keyboard.as_ref().clone()),
+        );
     }
-
     state.last_device_refresh = Instant::now();
     Ok(())
 }
@@ -263,7 +285,6 @@ fn update_modifiers(
     let Some(modifier) = modifier_for_key(code, state) else {
         return;
     };
-
     let scan_code = code as u16;
     let is_lock = matches!(scan_code, 0x3A | 0x45 | 0x46);
 

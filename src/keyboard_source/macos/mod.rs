@@ -10,83 +10,154 @@ use std::{
     collections::HashMap,
     ffi::c_void,
     io, ptr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::JoinHandle,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::error;
 
 const IOHID_OPTIONS_TYPE_NONE: u32 = 0;
 const IOHID_OPTIONS_TYPE_SEIZE_DEVICE: u32 = 1;
 
+/// Maximum amount of time the HID run loop waits before checking
+/// for commands/shutdown.
+const RUN_LOOP_TICK_SECONDS: f64 = 0.01;
+
 pub(super) const USAGE_PAGE_GENERIC_DESKTOP: i32 = 1;
 pub(super) const USAGE_KEYBOARD: i32 = 6;
 
-/// Context state passed to the C callbacks.
-struct HidContext {
-    sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-    keyboards: HashMap<isize, Arc<Keyboard>>,
-    modifiers: HashMap<isize, Modifiers>,
+/// Identifies an IOHID device for the lifetime of the HID manager.
+///
+/// This is only an in-process bookkeeping identifier. It must never be
+/// treated as a persistent device identifier.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub(super) struct DeviceId(usize);
 
-    /// Currently connected devices.
+impl From<IOHIDDeviceRef> for DeviceId {
+    fn from(device: IOHIDDeviceRef) -> Self {
+        Self(device as usize)
+    }
+}
+
+/// State owned exclusively by the macOS HID thread.
+///
+/// The raw IOKit references in this structure never cross into Tokio.
+struct DeviceState {
+    /// Keyboard description associated with this HID device.
+    keyboard: Arc<Keyboard>,
+
+    /// Reference supplied by IOHIDManager.
     ///
-    /// The raw `IOHIDDeviceRef` is stored as `usize` so this shared state
-    /// remains Send + Sync.
-    devices: Arc<Mutex<HashMap<isize, (Arc<Keyboard>, usize)>>>,
+    /// The manager owns this reference. We only borrow it while the
+    /// corresponding device is registered with the manager.
+    device: IOHIDDeviceRef,
 
-    /// Independently opened HID device references that are currently seized.
-    consumed: Arc<Mutex<HashMap<isize, usize>>>,
+    /// Independently-created device reference used for seizure.
+    ///
+    /// We own this reference and must close/release it.
+    consumed_device: Option<IOHIDDeviceRef>,
+}
+
+enum HidCommand {
+    Consume {
+        keyboard: Keyboard,
+        response: oneshot::Sender<io::Result<()>>,
+    },
+
+    Release {
+        keyboard: Keyboard,
+        response: oneshot::Sender<io::Result<()>>,
+    },
+}
+
+struct HidContext {
+    sender: tokio::sync::mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+
+    /// All active keyboards known by the HID manager.
+    keyboards: HashMap<DeviceId, Arc<Keyboard>>,
+
+    /// Current modifier state per physical HID device.
+    modifiers: HashMap<DeviceId, Modifiers>,
+
+    /// Complete HID device state.
+    ///
+    /// All access occurs on the HID thread.
+    devices: HashMap<DeviceId, DeviceState>,
 }
 
 pub struct MacosKeyboardSource {
-    receiver: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
-    shutdown: broadcast::Sender<()>,
+    receiver: tokio::sync::mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
 
-    devices: Arc<Mutex<HashMap<isize, (Arc<Keyboard>, usize)>>>,
-    consumed: Arc<Mutex<HashMap<isize, usize>>>,
+    command_sender: Sender<HidCommand>,
+
+    shutdown: Arc<AtomicBool>,
+
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl KeyboardSource for MacosKeyboardSource {
     async fn new() -> io::Result<Self> {
-        let (sender, receiver) = mpsc::channel(128);
-        let (shutdown, _) = broadcast::channel(1);
-        let shutdown_rx = shutdown.subscribe();
-        let (init_tx, init_rx) = oneshot::channel();
+        let (event_sender, receiver) = tokio::sync::mpsc::channel(128);
 
-        let devices = Arc::new(Mutex::new(HashMap::new()));
-        let consumed = Arc::new(Mutex::new(HashMap::new()));
+        let (command_sender, command_receiver) = mpsc::channel();
 
-        let devices_for_thread = devices.clone();
-        let consumed_for_thread = consumed.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        std::thread::spawn(move || {
-            if let Err(error) =
-                macos_hid_loop(sender, shutdown_rx, devices_for_thread, consumed_for_thread)
-            {
-                let _ = init_tx.send(Err(error));
-                error!("macOS HID loop terminated unexpectedly");
-            } else {
-                let _ = init_tx.send(Ok(()));
+        let shutdown_for_thread = Arc::clone(&shutdown);
+
+        let (init_sender, init_receiver) = oneshot::channel();
+
+        let join_handle = std::thread::spawn(move || {
+            if let Err(error) = macos_hid_loop(
+                event_sender,
+                command_receiver,
+                shutdown_for_thread,
+                init_sender,
+            ) {
+                error!(
+                    error = %error,
+                    "macOS HID loop terminated unexpectedly"
+                );
             }
         });
 
-        match init_rx.await {
+        match init_receiver.await {
             Ok(Ok(())) => Ok(Self {
                 receiver,
+                command_sender,
                 shutdown,
-                devices,
-                consumed,
+                join_handle: Some(join_handle),
             }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                "macOS initialization thread died unexpectedly",
-            )),
+
+            Ok(Err(error)) => {
+                shutdown.store(true, Ordering::Release);
+
+                let _ = join_handle.join();
+
+                Err(error)
+            }
+
+            Err(_) => {
+                shutdown.store(true, Ordering::Release);
+
+                let _ = join_handle.join();
+
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "macOS HID initialization thread died unexpectedly",
+                ))
+            }
         }
     }
 
     async fn receive_event(&mut self) -> Result<KeyboardEvent, io::Error> {
         match self.receiver.recv().await {
             Some(result) => result,
+
             None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "macOS device event channel closed",
@@ -97,56 +168,128 @@ impl KeyboardSource for MacosKeyboardSource {
     fn enumerate_keyboards(&self) -> Vec<Keyboard> {
         match enumerate_macos_keyboards() {
             Ok(keyboards) => keyboards,
+
             Err(error) => {
-                error!(error = %error, "Failed to enumerate macOS keyboards");
+                error!(
+                    error = %error,
+                    "Failed to enumerate macOS keyboards"
+                );
+
                 Vec::new()
             }
         }
     }
 
     async fn consume(&mut self, keyboard: &Keyboard) -> io::Result<()> {
-        consume_macos_keyboard(&self.devices, &self.consumed, keyboard)
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.command_sender
+            .send(HidCommand::Consume {
+                keyboard: keyboard.clone(),
+                response: response_sender,
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "macOS HID thread is no longer running",
+                )
+            })?;
+
+        response_receiver.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "macOS HID thread stopped before consume completed",
+            )
+        })?
     }
 
     async fn release(&mut self, keyboard: &Keyboard) -> io::Result<()> {
-        release_macos_keyboard(&self.devices, &self.consumed, keyboard)
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.command_sender
+            .send(HidCommand::Release {
+                keyboard: keyboard.clone(),
+                response: response_sender,
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "macOS HID thread is no longer running",
+                )
+            })?;
+
+        response_receiver.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "macOS HID thread stopped before release completed",
+            )
+        })?
     }
 }
 
 impl Drop for MacosKeyboardSource {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(());
+        self.shutdown.store(true, Ordering::Release);
+
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
     }
 }
 
-// --- Core OS Integrations ---
+// ============================================================
+// HID Thread
+// ============================================================
 
 fn macos_hid_loop(
-    sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-    mut shutdown: broadcast::Receiver<()>,
-    devices: Arc<Mutex<HashMap<isize, (Arc<Keyboard>, usize)>>>,
-    consumed: Arc<Mutex<HashMap<isize, usize>>>,
+    sender: tokio::sync::mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    command_receiver: Receiver<HidCommand>,
+    shutdown: Arc<AtomicBool>,
+    init_sender: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<()> {
     unsafe {
         let manager = IOHIDManagerCreate(ptr::null_mut(), 0);
 
         if manager.is_null() {
-            return Err(io::Error::new(
+            let error = io::Error::new(io::ErrorKind::Other, "Failed to create IOHIDManager");
+
+            let _ = init_sender.send(Err(io::Error::new(
                 io::ErrorKind::Other,
                 "Failed to create IOHIDManager",
-            ));
+            )));
+
+            return Err(error);
         }
 
-        let matching_dict = create_matching_dictionary();
+        let matching_dict = match create_matching_dictionary() {
+            Some(dict) => dict,
+
+            None => {
+                CFRelease(manager);
+
+                let error = io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to create macOS HID matching dictionary",
+                );
+
+                let _ = init_sender.send(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to create macOS HID matching dictionary",
+                )));
+
+                return Err(error);
+            }
+        };
+
         IOHIDManagerSetDeviceMatching(manager, matching_dict);
+
         CFRelease(matching_dict);
 
         let context = Box::new(HidContext {
             sender,
             keyboards: HashMap::new(),
             modifiers: HashMap::new(),
-            devices: devices.clone(),
-            consumed: consumed.clone(),
+            devices: HashMap::new(),
         });
 
         let context_ptr = Box::into_raw(context) as *mut c_void;
@@ -159,60 +302,122 @@ fn macos_hid_loop(
 
         let run_loop = CFRunLoopGetCurrent();
 
-        let default_mode = CFStringCreateWithCString(
-            ptr::null_mut(),
-            b"kCFRunLoopDefaultMode\0".as_ptr() as _,
-            0x08000100,
-        );
+        if run_loop.is_null() {
+            let _ = Box::from_raw(context_ptr as *mut HidContext);
+
+            CFRelease(manager);
+
+            let error = io::Error::new(io::ErrorKind::Other, "Failed to obtain current CFRunLoop");
+
+            let _ = init_sender.send(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to obtain current CFRunLoop",
+            )));
+
+            return Err(error);
+        }
+
+        let default_mode = match create_cf_string("kCFRunLoopDefaultMode") {
+            Some(mode) => mode,
+
+            None => {
+                let _ = Box::from_raw(context_ptr as *mut HidContext);
+
+                CFRelease(manager);
+
+                let error = io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to create CFRunLoop mode string",
+                );
+
+                let _ = init_sender.send(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to create CFRunLoop mode string",
+                )));
+
+                return Err(error);
+            }
+        };
 
         IOHIDManagerScheduleWithRunLoop(manager, run_loop, default_mode);
 
-        if IOHIDManagerOpen(manager, IOHID_OPTIONS_TYPE_NONE) != 0 {
+        let result = IOHIDManagerOpen(manager, IOHID_OPTIONS_TYPE_NONE);
+
+        if result != 0 {
             let _ = Box::from_raw(context_ptr as *mut HidContext);
 
             CFRelease(default_mode);
             CFRelease(manager);
 
-            return Err(io::Error::new(
+            let error = io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "Failed to open IOHIDManager",
-            ));
+                format!("Failed to open IOHIDManager: 0x{:08x}", result as u32),
+            );
+
+            let _ = init_sender.send(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("Failed to open IOHIDManager: 0x{:08x}", result as u32),
+            )));
+
+            return Err(error);
         }
 
-        let run_loop_ptr = run_loop as usize;
+        // Initialization is complete as soon as the HID manager has
+        // successfully opened. The run loop has not ended yet.
+        let _ = init_sender.send(Ok(()));
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        // --------------------------------------------------------
+        // Main HID thread loop
+        // --------------------------------------------------------
+        while !shutdown.load(Ordering::Acquire) {
+            // Run the CFRunLoop for a short period. HID callbacks are
+            // dispatched during this call.
+            let _ = CFRunLoopRunInMode(default_mode, RUN_LOOP_TICK_SECONDS, 0);
 
-            rt.block_on(async {
-                let _ = shutdown.recv().await;
-            });
+            // Commands are deliberately processed on this same thread
+            // that owns the IOKit device references.
+            while let Ok(command) = command_receiver.try_recv() {
+                process_command(command, context_ptr);
+            }
+        }
 
-            CFRunLoopStop(run_loop_ptr as CFRunLoopRef);
-        });
+        // --------------------------------------------------------
+        // Shutdown
+        // --------------------------------------------------------
 
-        CFRunLoopRun();
+        // Drop any commands that raced with shutdown, returning an
+        // appropriate error to their callers.
+        while let Ok(command) = command_receiver.try_recv() {
+            let error = io::Error::new(
+                io::ErrorKind::Interrupted,
+                "macOS HID source is shutting down",
+            );
+
+            match command {
+                HidCommand::Consume { response, .. } | HidCommand::Release { response, .. } => {
+                    let _ = response.send(Err(error));
+                }
+            }
+        }
 
         IOHIDManagerUnscheduleFromRunLoop(manager, run_loop, default_mode);
 
-        IOHIDManagerClose(manager, IOHID_OPTIONS_TYPE_NONE);
+        let _ = IOHIDManagerClose(manager, IOHID_OPTIONS_TYPE_NONE);
+
+        // All callbacks are finished once the manager has been closed
+        // and the run loop is no longer being executed.
+        //
+        // First clean up every consumed device that we own.
+        let context = &mut *context_ptr.cast::<HidContext>();
+
+        for device_state in context.devices.values_mut() {
+            if let Some(consumed_device) = device_state.consumed_device.take() {
+                close_and_release_device(consumed_device);
+            }
+        }
 
         CFRelease(default_mode);
         CFRelease(manager);
-
-        // Release any devices still consumed when the source shuts down.
-        if let Ok(mut consumed) = consumed.lock() {
-            for (_, device_ptr) in consumed.drain() {
-                let device = device_ptr as IOHIDDeviceRef;
-
-                let _ = IOHIDDeviceClose(device, IOHID_OPTIONS_TYPE_NONE);
-
-                CFRelease(device as CFTypeRef);
-            }
-        }
 
         let _ = Box::from_raw(context_ptr as *mut HidContext);
     }
@@ -220,56 +425,44 @@ fn macos_hid_loop(
     Ok(())
 }
 
-fn find_device_id(
-    devices: &Mutex<HashMap<isize, (Arc<Keyboard>, usize)>>,
-    keyboard: &Keyboard,
-) -> io::Result<(isize, usize)> {
-    let devices = devices.lock().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "macOS HID device state mutex is poisoned",
-        )
-    })?;
+fn process_command(command: HidCommand, context_ptr: *mut c_void) {
+    let context = unsafe { &mut *context_ptr.cast::<HidContext>() };
 
-    devices
-        .iter()
-        .find_map(|(&device_id, (kb, device_ptr))| {
-            if kb.as_ref() == keyboard {
-                Some((device_id, *device_ptr))
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Keyboard is not currently connected",
-            )
-        })
+    match command {
+        HidCommand::Consume { keyboard, response } => {
+            let result = consume_macos_keyboard(context, &keyboard);
+
+            let _ = response.send(result);
+        }
+
+        HidCommand::Release { keyboard, response } => {
+            let result = release_macos_keyboard(context, &keyboard);
+
+            let _ = response.send(result);
+        }
+    }
 }
 
-fn consume_macos_keyboard(
-    devices: &Mutex<HashMap<isize, (Arc<Keyboard>, usize)>>,
-    consumed: &Mutex<HashMap<isize, usize>>,
-    keyboard: &Keyboard,
-) -> io::Result<()> {
-    let (device_id, device_ptr) = find_device_id(devices, keyboard)?;
+// ============================================================
+// Device consume/release
+// ============================================================
 
-    let mut consumed_devices = consumed.lock().map_err(|_| {
+fn consume_macos_keyboard(context: &mut HidContext, keyboard: &Keyboard) -> io::Result<()> {
+    let device_id = find_device_id(context, keyboard)?;
+
+    let device_state = context.devices.get_mut(&device_id).ok_or_else(|| {
         io::Error::new(
-            io::ErrorKind::Other,
-            "macOS consumed-device state mutex is poisoned",
+            io::ErrorKind::NotFound,
+            "Keyboard is not currently connected",
         )
     })?;
 
-    if consumed_devices.contains_key(&device_id) {
+    if device_state.consumed_device.is_some() {
         return Ok(());
     }
 
     unsafe {
-        let device = device_ptr as IOHIDDeviceRef;
-
-        let service = IOHIDDeviceGetService(device);
+        let service = IOHIDDeviceGetService(device_state.device);
 
         if service == 0 {
             return Err(io::Error::new(
@@ -278,7 +471,6 @@ fn consume_macos_keyboard(
             ));
         }
 
-        // Create an independent HID device reference.
         let seized_device = IOHIDDeviceCreate(ptr::null_mut(), service);
 
         if seized_device.is_null() {
@@ -299,41 +491,33 @@ fn consume_macos_keyboard(
             ));
         }
 
-        consumed_devices.insert(device_id, seized_device as usize);
+        device_state.consumed_device = Some(seized_device);
     }
 
     Ok(())
 }
 
-fn release_macos_keyboard(
-    devices: &Mutex<HashMap<isize, (Arc<Keyboard>, usize)>>,
-    consumed: &Mutex<HashMap<isize, usize>>,
-    keyboard: &Keyboard,
-) -> io::Result<()> {
-    let (device_id, _) = find_device_id(devices, keyboard)?;
+fn release_macos_keyboard(context: &mut HidContext, keyboard: &Keyboard) -> io::Result<()> {
+    let device_id = find_device_id(context, keyboard)?;
 
-    let consumed_device = {
-        let mut consumed_devices = consumed.lock().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                "macOS consumed-device state mutex is poisoned",
-            )
-        })?;
+    let device_state = context.devices.get_mut(&device_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Keyboard is not currently connected",
+        )
+    })?;
 
-        consumed_devices.remove(&device_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Keyboard is not currently consumed",
-            )
-        })?
-    };
+    let consumed_device = device_state.consumed_device.take().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Keyboard is not currently consumed",
+        )
+    })?;
 
     unsafe {
-        let device = consumed_device as IOHIDDeviceRef;
+        let result = IOHIDDeviceClose(consumed_device, IOHID_OPTIONS_TYPE_NONE);
 
-        let result = IOHIDDeviceClose(device, IOHID_OPTIONS_TYPE_NONE);
-
-        CFRelease(device as CFTypeRef);
+        CFRelease(consumed_device as CFTypeRef);
 
         if result != 0 {
             return Err(io::Error::new(
@@ -346,9 +530,33 @@ fn release_macos_keyboard(
     Ok(())
 }
 
+fn find_device_id(context: &HidContext, keyboard: &Keyboard) -> io::Result<DeviceId> {
+    context
+        .devices
+        .iter()
+        .find_map(|(&device_id, device_state)| {
+            if device_state.keyboard.as_ref() == keyboard {
+                Some(device_id)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Keyboard is not currently connected",
+            )
+        })
+}
+
+// ============================================================
+// Enumeration
+// ============================================================
+
 fn enumerate_macos_keyboards() -> Result<Vec<Keyboard>, io::Error> {
     unsafe {
         let manager = IOHIDManagerCreate(ptr::null_mut(), 0);
+
         if manager.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -356,11 +564,25 @@ fn enumerate_macos_keyboards() -> Result<Vec<Keyboard>, io::Error> {
             ));
         }
 
-        let matching_dict = create_matching_dictionary();
+        let matching_dict = match create_matching_dictionary() {
+            Some(dict) => dict,
+
+            None => {
+                CFRelease(manager);
+
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Failed to create macOS HID matching dictionary",
+                ));
+            }
+        };
+
         IOHIDManagerSetDeviceMatching(manager, matching_dict);
+
         CFRelease(matching_dict);
 
         let device_set = IOHIDManagerCopyDevices(manager);
+
         CFRelease(manager);
 
         if device_set.is_null() {
@@ -368,21 +590,40 @@ fn enumerate_macos_keyboards() -> Result<Vec<Keyboard>, io::Error> {
         }
 
         let count = CFSetGetCount(device_set);
-        let mut devices: Vec<IOHIDDeviceRef> = vec![ptr::null_mut(); count as usize];
-        CFSetGetValues(device_set, devices.as_mut_ptr() as _);
+
+        if count <= 0 {
+            CFRelease(device_set);
+            return Ok(Vec::new());
+        }
+
+        let mut devices = vec![ptr::null_mut(); count as usize];
+
+        CFSetGetValues(device_set, devices.as_mut_ptr() as *mut *const c_void);
 
         let keyboards = devices.into_iter().filter_map(map_to_keyboard).collect();
+
         CFRelease(device_set);
+
         Ok(keyboards)
     }
 }
 
+// ============================================================
+// Keyboard mapping
+// ============================================================
+
 pub(super) fn map_to_keyboard(device: IOHIDDeviceRef) -> Option<Keyboard> {
-    let name = get_string_property(device, b"Product\0");
-    let vendor_id = get_int_property(device, b"VendorID\0").map(|v| format!("{:04x}", v));
-    let product_id = get_int_property(device, b"ProductID\0").map(|p| format!("{:04x}", p));
-    let serial = get_string_property(device, b"SerialNumber\0");
-    let physical_path = get_int_property(device, b"LocationID\0").map(|l| format!("{:x}", l));
+    let name = get_string_property(device, "Product");
+
+    let vendor_id = get_int_property(device, "VendorID").map(|value| format!("{value:04x}"));
+
+    let product_id = get_int_property(device, "ProductID").map(|value| format!("{value:04x}"));
+
+    let serial = get_string_property(device, "SerialNumber");
+
+    // macOS does not expose a Linux-style /sys/... path here.
+    // LocationID is used as the platform-specific physical location.
+    let physical_path = get_int_property(device, "LocationID").map(|value| format!("{value:x}"));
 
     if name.is_none() && vendor_id.is_none() && product_id.is_none() {
         return None;

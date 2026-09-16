@@ -1,10 +1,76 @@
 use super::ffi_declarations::*;
 use super::key_mapping::*;
-use super::{HidContext, map_to_keyboard};
+use super::{DeviceId, DeviceState, HidContext};
 use crate::keyboard_source::KeyboardEvent;
-use keyboard_types::{KeyboardEvent as KeyEvent, Modifiers};
-use std::{ffi::c_void, ptr, sync::Arc};
+use keyboard_types::{KeyState, KeyboardEvent as KeyEvent, Modifiers};
+use std::{
+    ffi::{CString, c_void},
+    ptr,
+    sync::Arc,
+};
 use tracing::warn;
+
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+const K_CF_NUMBER_SINT32_TYPE: isize = 3;
+
+/// # Safety
+///
+/// `context` must be the `HidContext` pointer registered with the HID
+/// manager and must remain valid until the manager has been closed.
+#[inline]
+unsafe fn get_ctx<'a>(context: *mut c_void) -> Option<&'a mut HidContext> {
+    if context.is_null() {
+        None
+    } else {
+        // SAFETY: Enforced by the HID manager callback lifetime.
+        Some(unsafe { &mut *(context as *mut HidContext) })
+    }
+}
+
+/// Closes and releases an IOHIDDeviceRef owned by this crate.
+///
+/// The caller must only pass references created with IOHIDDeviceCreate.
+pub(super) unsafe fn close_and_release_device(device: IOHIDDeviceRef) {
+    if device.is_null() {
+        return;
+    }
+
+    let _ = unsafe { IOHIDDeviceClose(device, 0) };
+
+    unsafe {
+        CFRelease(device as CFTypeRef);
+    }
+}
+
+pub(super) unsafe fn create_cf_string(value: &str) -> Option<CFStringRef> {
+    let c_string = CString::new(value).ok()?;
+
+    let string = unsafe {
+        CFStringCreateWithCString(
+            ptr::null_mut(),
+            c_string.as_ptr(),
+            K_CF_STRING_ENCODING_UTF8,
+        )
+    };
+
+    (!string.is_null()).then_some(string)
+}
+
+unsafe fn cf_num_i32(value: i32) -> Option<CFNumberRef> {
+    let number = unsafe {
+        CFNumberCreate(
+            ptr::null_mut(),
+            K_CF_NUMBER_SINT32_TYPE,
+            &value as *const _ as *const c_void,
+        )
+    };
+
+    (!number.is_null()).then_some(number)
+}
+
+// ============================================================
+// Device callbacks
+// ============================================================
 
 pub(super) extern "C" fn matching_callback(
     context: *mut c_void,
@@ -12,26 +78,46 @@ pub(super) extern "C" fn matching_callback(
     _sender: *mut c_void,
     device: IOHIDDeviceRef,
 ) {
-    if context.is_null() {
+    let Some(ctx) = (unsafe { get_ctx(context) }) else {
+        return;
+    };
+
+    if device.is_null() {
         return;
     }
 
-    let ctx = unsafe { &mut *(context as *mut HidContext) };
+    let Some(keyboard) = super::map_to_keyboard(device) else {
+        return;
+    };
 
-    if let Some(keyboard) = map_to_keyboard(device) {
-        let kb_arc = Arc::new(keyboard);
-        let device_id = device as isize;
+    let device_id = DeviceId::from(device);
 
-        ctx.keyboards.insert(device_id, kb_arc.clone());
-        ctx.modifiers.insert(device_id, Modifiers::empty());
+    if ctx.devices.contains_key(&device_id) {
+        warn!(?device_id, "Received duplicate macOS HID matching callback");
 
-        if let Ok(mut devices) = ctx.devices.lock() {
-            devices.insert(device_id, (kb_arc.clone(), device as usize));
-        }
+        return;
+    }
 
-        if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Plugged(kb_arc))) {
-            warn!(error = %e, "Dropped Plugged event: channel full");
-        }
+    let keyboard = Arc::new(keyboard);
+
+    ctx.keyboards.insert(device_id, Arc::clone(&keyboard));
+
+    ctx.modifiers.insert(device_id, Modifiers::empty());
+
+    ctx.devices.insert(
+        device_id,
+        DeviceState {
+            keyboard: Arc::clone(&keyboard),
+            device,
+            consumed_device: None,
+        },
+    );
+
+    if let Err(error) = ctx.sender.try_send(Ok(KeyboardEvent::Plugged(keyboard))) {
+        warn!(
+            error = %error,
+            "Dropped Plugged event: channel full"
+        );
     }
 }
 
@@ -41,34 +127,46 @@ pub(super) extern "C" fn removal_callback(
     _sender: *mut c_void,
     device: IOHIDDeviceRef,
 ) {
-    if context.is_null() {
+    let Some(ctx) = (unsafe { get_ctx(context) }) else {
+        return;
+    };
+
+    if device.is_null() {
         return;
     }
 
-    let ctx = unsafe { &mut *(context as *mut HidContext) };
-    let device_id = device as isize;
+    let device_id = DeviceId::from(device);
 
+    // The callback executes on the HID thread, so the device cannot
+    // concurrently disappear while we're manipulating this state.
+    let Some(mut device_state) = ctx.devices.remove(&device_id) else {
+        return;
+    };
+
+    ctx.keyboards.remove(&device_id);
     ctx.modifiers.remove(&device_id);
 
-    if let Ok(mut consumed) = ctx.consumed.lock() {
-        if let Some(consumed_device) = consumed.remove(&device_id) {
-            unsafe {
-                let _ = IOHIDDeviceClose(consumed_device as IOHIDDeviceRef, 0);
-                CFRelease(consumed_device as CFTypeRef);
-            }
+    if let Some(consumed_device) = device_state.consumed_device.take() {
+        // SAFETY: This reference was created by this crate.
+        unsafe {
+            close_and_release_device(consumed_device);
         }
     }
 
-    if let Ok(mut devices) = ctx.devices.lock() {
-        devices.remove(&device_id);
-    }
-
-    if let Some(kb) = ctx.keyboards.remove(&device_id) {
-        if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Unplugged(kb))) {
-            warn!(error = %e, "Dropped Unplugged event: channel full");
-        }
+    if let Err(error) = ctx
+        .sender
+        .try_send(Ok(KeyboardEvent::Unplugged(device_state.keyboard)))
+    {
+        warn!(
+            error = %error,
+            "Dropped Unplugged event: channel full"
+        );
     }
 }
+
+// ============================================================
+// Input callback
+// ============================================================
 
 pub(super) extern "C" fn input_callback(
     context: *mut c_void,
@@ -76,73 +174,110 @@ pub(super) extern "C" fn input_callback(
     _sender: *mut c_void,
     value: IOHIDValueRef,
 ) {
-    if context.is_null() {
+    let Some(ctx) = (unsafe { get_ctx(context) }) else {
+        return;
+    };
+
+    if value.is_null() {
         return;
     }
-    let ctx = unsafe { &mut *(context as *mut HidContext) };
+
     unsafe {
-        let int_value = IOHIDValueGetIntegerValue(value);
-        let Some((state, repeat)) = macos_value_to_key_state(int_value) else {
+        let integer_value = IOHIDValueGetIntegerValue(value);
+
+        let Some((state, repeat)) = macos_value_to_key_state(integer_value) else {
             return;
         };
 
         let element = IOHIDValueGetElement(value);
-        let usage = IOHIDElementGetUsage(element) as usize;
-        let device = IOHIDElementGetDevice(element);
-        let device_id = device as isize;
 
-        let Some(kb) = ctx.keyboards.get(&device_id) else {
+        if element.is_null() {
+            return;
+        }
+
+        let usage = IOHIDElementGetUsage(element);
+
+        if !is_keyboard_usage(usage) {
+            return;
+        }
+
+        let device = IOHIDElementGetDevice(element);
+
+        if device.is_null() {
+            return;
+        }
+
+        let device_id = DeviceId::from(device);
+
+        let Some(keyboard) = ctx.keyboards.get(&device_id) else {
             return;
         };
-
-        let code = macos_hid_to_code(usage);
-        let key = macos_hid_to_key(usage);
-        let location = macos_hid_to_location(usage);
-        let modifier = modifier_for_usage(usage);
 
         let Some(modifiers) = ctx.modifiers.get_mut(&device_id) else {
             return;
         };
 
-        let event_modifiers = match state {
-            keyboard_types::KeyState::Down => {
-                if let Some(modifier) = modifier {
+        let code = macos_hid_to_code(usage);
+
+        let key = macos_hid_to_key(usage);
+
+        let location = macos_hid_to_location(usage);
+
+        let modifier = modifier_for_usage(usage);
+
+        if state == KeyState::Down {
+            if let Some(modifier) = modifier {
+                if is_lock_modifier(usage) {
+                    // Lock modifiers toggle state on key-down.
+                    if modifiers.contains(modifier) {
+                        modifiers.remove(modifier);
+                    } else {
+                        modifiers.insert(modifier);
+                    }
+                } else {
                     modifiers.insert(modifier);
                 }
-                *modifiers
             }
-            keyboard_types::KeyState::Up => *modifiers,
-        };
+        }
 
         let key_event = KeyEvent {
             state,
             key,
             code,
             location,
-            modifiers: event_modifiers,
+            modifiers: *modifiers,
             repeat,
             is_composing: false,
         };
 
-        if let Err(e) = ctx
+        if let Err(error) = ctx
             .sender
-            .try_send(Ok(KeyboardEvent::KeyAction(kb.clone(), key_event)))
+            .try_send(Ok(KeyboardEvent::KeyAction(keyboard.clone(), key_event)))
         {
-            warn!(error = %e, "Dropped Pressed event: channel full");
+            warn!(
+                error = %error,
+                "Dropped key event: channel full"
+            );
         }
 
-        // Remove modifier after sending the Up event
-        if state == keyboard_types::KeyState::Up {
+        // For non-lock modifiers, the modifier is removed AFTER
+        // emitting the release event. Therefore a Shift-up event
+        // still correctly reports Shift as active during that event.
+        if state == KeyState::Up {
             if let Some(modifier) = modifier {
-                modifiers.remove(modifier);
+                if !is_lock_modifier(usage) {
+                    modifiers.remove(modifier);
+                }
             }
         }
     }
 }
 
-// --- Helper Functions ---
+// ============================================================
+// CoreFoundation helpers
+// ============================================================
 
-pub(super) fn create_matching_dictionary() -> CFMutableDictionaryRef {
+pub(super) fn create_matching_dictionary() -> Option<CFMutableDictionaryRef> {
     unsafe {
         let dict = CFDictionaryCreateMutable(
             ptr::null_mut(),
@@ -150,69 +285,94 @@ pub(super) fn create_matching_dictionary() -> CFMutableDictionaryRef {
             kCFTypeDictionaryKeyCallBacks,
             kCFTypeDictionaryValueCallBacks,
         );
-        let page_key = CFStringCreateWithCString(
-            ptr::null_mut(),
-            b"DeviceUsagePage\0".as_ptr() as _,
-            0x08000100,
-        );
-        let usage_key =
-            CFStringCreateWithCString(ptr::null_mut(), b"DeviceUsage\0".as_ptr() as _, 0x08000100);
-        let page_val = super::USAGE_PAGE_GENERIC_DESKTOP;
-        let usage_val = super::USAGE_KEYBOARD;
-        let page_num = CFNumberCreate(ptr::null_mut(), 3, &page_val as *const _ as _);
-        let usage_num = CFNumberCreate(ptr::null_mut(), 3, &usage_val as *const _ as _);
 
-        CFDictionarySetValue(dict, page_key, page_num);
-        CFDictionarySetValue(dict, usage_key, usage_num);
+        if dict.is_null() {
+            return None;
+        }
+
+        let page_key = create_cf_string("DeviceUsagePage")?;
+
+        let usage_key = create_cf_string("DeviceUsage")?;
+
+        let page_number = cf_num_i32(super::USAGE_PAGE_GENERIC_DESKTOP)?;
+
+        let usage_number = cf_num_i32(super::USAGE_KEYBOARD)?;
+
+        CFDictionarySetValue(dict, page_key, page_number);
+
+        CFDictionarySetValue(dict, usage_key, usage_number);
+
         CFRelease(page_key);
         CFRelease(usage_key);
-        CFRelease(page_num);
-        CFRelease(usage_num);
-        dict
+        CFRelease(page_number);
+        CFRelease(usage_number);
+
+        Some(dict)
     }
 }
 
-pub(super) fn get_string_property(device: IOHIDDeviceRef, key: &[u8]) -> Option<String> {
+pub(super) fn get_string_property(device: IOHIDDeviceRef, key: &str) -> Option<String> {
+    if device.is_null() {
+        return None;
+    }
+
     unsafe {
-        let cf_key = CFStringCreateWithCString(ptr::null_mut(), key.as_ptr() as _, 0x08000100);
-        let cf_val = IOHIDDeviceGetProperty(device, cf_key);
+        let cf_key = create_cf_string(key)?;
+
+        let cf_value = IOHIDDeviceGetProperty(device, cf_key);
+
         CFRelease(cf_key);
 
-        if cf_val.is_null() || CFGetTypeID(cf_val) != CFStringGetTypeID() {
+        if cf_value.is_null() || CFGetTypeID(cf_value) != CFStringGetTypeID() {
             return None;
         }
-        let mut buffer = vec![0u8; 256];
-        if CFStringGetCString(
-            cf_val,
+
+        let mut buffer = [0_u8; 256];
+
+        let success = CFStringGetCString(
+            cf_value,
             buffer.as_mut_ptr() as *mut i8,
             buffer.len() as isize,
-            0x08000100,
-        ) != 0
-        {
-            if let Some(end) = buffer.iter().position(|&c| c == 0) {
-                buffer.truncate(end);
-            }
-            String::from_utf8(buffer).ok()
-        } else {
-            None
+            K_CF_STRING_ENCODING_UTF8,
+        ) != 0;
+
+        if !success {
+            return None;
         }
+
+        let length = buffer
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(buffer.len());
+
+        String::from_utf8(buffer[..length].to_vec()).ok()
     }
 }
 
-pub(super) fn get_int_property(device: IOHIDDeviceRef, key: &[u8]) -> Option<i32> {
+pub(super) fn get_int_property(device: IOHIDDeviceRef, key: &str) -> Option<i32> {
+    if device.is_null() {
+        return None;
+    }
+
     unsafe {
-        let cf_key = CFStringCreateWithCString(ptr::null_mut(), key.as_ptr() as _, 0x08000100);
-        let cf_val = IOHIDDeviceGetProperty(device, cf_key);
+        let cf_key = create_cf_string(key)?;
+
+        let cf_value = IOHIDDeviceGetProperty(device, cf_key);
+
         CFRelease(cf_key);
 
-        if cf_val.is_null() || CFGetTypeID(cf_val) != CFNumberGetTypeID() {
+        if cf_value.is_null() || CFGetTypeID(cf_value) != CFNumberGetTypeID() {
             return None;
         }
-        let mut result: i32 = 0;
-        if CFNumberGetValue(cf_val, 3, &mut result as *mut _ as _) != 0 {
-            Some(result)
-        } else {
-            None
-        }
+
+        let mut result = 0_i32;
+
+        let success = CFNumberGetValue(
+            cf_value,
+            K_CF_NUMBER_SINT32_TYPE,
+            &mut result as *mut _ as *mut c_void,
+        ) != 0;
+
+        success.then_some(result)
     }
 }

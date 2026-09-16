@@ -1,6 +1,10 @@
 use keyboard_types::{Code, Key, KeyState, Location, Modifiers, NamedKey};
 
-pub fn macos_hid_to_code(usage: usize) -> Code {
+pub fn is_keyboard_usage(usage: u32) -> bool {
+    (0x04..=0xE7).contains(&usage)
+}
+
+pub fn macos_hid_to_code(usage: u32) -> Code {
     match usage {
         // Letters
         0x04 => Code::KeyA,
@@ -29,6 +33,7 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x1B => Code::KeyX,
         0x1C => Code::KeyY,
         0x1D => Code::KeyZ,
+
         // Number row
         0x1E => Code::Digit1,
         0x1F => Code::Digit2,
@@ -40,12 +45,14 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x25 => Code::Digit8,
         0x26 => Code::Digit9,
         0x27 => Code::Digit0,
-        // Control keys
+
+        // Control
         0x28 => Code::Enter,
         0x29 => Code::Escape,
         0x2A => Code::Backspace,
         0x2B => Code::Tab,
         0x2C => Code::Space,
+
         // Symbols
         0x2D => Code::Minus,
         0x2E => Code::Equal,
@@ -59,9 +66,11 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x36 => Code::Comma,
         0x37 => Code::Period,
         0x38 => Code::Slash,
-        // Lock keys
+
+        // Lock
         0x39 => Code::CapsLock,
-        // Function keys
+
+        // Function
         0x3A => Code::F1,
         0x3B => Code::F2,
         0x3C => Code::F3,
@@ -74,7 +83,8 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x43 => Code::F10,
         0x44 => Code::F11,
         0x45 => Code::F12,
-        // Navigation cluster
+
+        // Navigation
         0x46 => Code::PrintScreen,
         0x47 => Code::ScrollLock,
         0x48 => Code::Pause,
@@ -84,11 +94,13 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x4C => Code::Delete,
         0x4D => Code::End,
         0x4E => Code::PageDown,
-        // Arrow keys
+
+        // Arrows
         0x4F => Code::ArrowRight,
         0x50 => Code::ArrowLeft,
         0x51 => Code::ArrowDown,
         0x52 => Code::ArrowUp,
+
         // Numpad
         0x53 => Code::NumLock,
         0x54 => Code::NumpadDivide,
@@ -107,7 +119,8 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x61 => Code::Numpad9,
         0x62 => Code::Numpad0,
         0x63 => Code::NumpadDecimal,
-        // Extended function keys
+
+        // F13-F24
         0x68 => Code::F13,
         0x69 => Code::F14,
         0x6A => Code::F15,
@@ -120,6 +133,7 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0x71 => Code::F22,
         0x72 => Code::F23,
         0x73 => Code::F24,
+
         // Modifiers
         0xE0 => Code::ControlLeft,
         0xE1 => Code::ShiftLeft,
@@ -129,35 +143,48 @@ pub fn macos_hid_to_code(usage: usize) -> Code {
         0xE5 => Code::ShiftRight,
         0xE6 => Code::AltRight,
         0xE7 => Code::MetaRight,
+
         _ => Code::Unidentified,
     }
 }
 
-pub fn macos_hid_to_key(usage: usize) -> Key {
+/// Converts HID usages to logical named keys where the meaning is
+/// independent of the active keyboard layout.
+///
+/// Character-producing keys intentionally remain `Unidentified`.
+/// Raw HID usage does not tell us whether the active macOS layout
+/// produces `a`, `q`, `A`, etc. from a particular physical key.
+pub fn macos_hid_to_key(usage: u32) -> Key {
     let named_key = match usage {
-        0x29 => Some(NamedKey::Escape),
         0x28 | 0x58 => Some(NamedKey::Enter),
-        0x2B => Some(NamedKey::Tab),
+        0x29 => Some(NamedKey::Escape),
         0x2A => Some(NamedKey::Backspace),
+        0x2B => Some(NamedKey::Tab),
+
         0x4C => Some(NamedKey::Delete),
         0x49 => Some(NamedKey::Insert),
         0x4A => Some(NamedKey::Home),
         0x4D => Some(NamedKey::End),
         0x4B => Some(NamedKey::PageUp),
         0x4E => Some(NamedKey::PageDown),
+
         0x52 => Some(NamedKey::ArrowUp),
         0x51 => Some(NamedKey::ArrowDown),
         0x50 => Some(NamedKey::ArrowLeft),
         0x4F => Some(NamedKey::ArrowRight),
+
         0x39 => Some(NamedKey::CapsLock),
         0x53 => Some(NamedKey::NumLock),
         0x47 => Some(NamedKey::ScrollLock),
+
+        0x46 => Some(NamedKey::PrintScreen),
+        0x48 => Some(NamedKey::Pause),
+
         0xE0 | 0xE4 => Some(NamedKey::Control),
         0xE1 | 0xE5 => Some(NamedKey::Shift),
         0xE2 | 0xE6 => Some(NamedKey::Alt),
         0xE3 | 0xE7 => Some(NamedKey::Meta),
-        0x46 => Some(NamedKey::PrintScreen),
-        0x48 => Some(NamedKey::Pause),
+
         0x3A => Some(NamedKey::F1),
         0x3B => Some(NamedKey::F2),
         0x3C => Some(NamedKey::F3),
@@ -170,6 +197,7 @@ pub fn macos_hid_to_key(usage: usize) -> Key {
         0x43 => Some(NamedKey::F10),
         0x44 => Some(NamedKey::F11),
         0x45 => Some(NamedKey::F12),
+
         0x68 => Some(NamedKey::F13),
         0x69 => Some(NamedKey::F14),
         0x6A => Some(NamedKey::F15),
@@ -182,41 +210,55 @@ pub fn macos_hid_to_key(usage: usize) -> Key {
         0x71 => Some(NamedKey::F22),
         0x72 => Some(NamedKey::F23),
         0x73 => Some(NamedKey::F24),
+
         _ => None,
     };
+
     match named_key {
         Some(key) => Key::Named(key),
         None => Key::Named(NamedKey::Unidentified),
     }
 }
 
-pub fn macos_hid_to_location(usage: usize) -> Location {
+pub fn macos_hid_to_location(usage: u32) -> Location {
     match usage {
-        0xE0 | 0xE1 | 0xE2 | 0xE3 => Location::Left,
-        0xE4 | 0xE5 | 0xE6 | 0xE7 => Location::Right,
+        0xE0..=0xE3 => Location::Left,
+        0xE4..=0xE7 => Location::Right,
         0x53..=0x63 => Location::Numpad,
         _ => Location::Standard,
     }
 }
 
-pub fn modifier_for_usage(usage: usize) -> Option<Modifiers> {
+pub fn modifier_for_usage(usage: u32) -> Option<Modifiers> {
     match usage {
-        0xE1 | 0xE5 => Some(Modifiers::SHIFT),
         0xE0 | 0xE4 => Some(Modifiers::CONTROL),
-        0xE2 => Some(Modifiers::ALT),
-        0xE6 => Some(Modifiers::ALT_GRAPH),
+
+        0xE1 | 0xE5 => Some(Modifiers::SHIFT),
+
+        0xE2 | 0xE6 => Some(Modifiers::ALT),
+
         0xE3 | 0xE7 => Some(Modifiers::META),
+
         0x39 => Some(Modifiers::CAPS_LOCK),
+
         0x53 => Some(Modifiers::NUM_LOCK),
+
         0x47 => Some(Modifiers::SCROLL_LOCK),
+
         _ => None,
     }
+}
+
+pub fn is_lock_modifier(usage: u32) -> bool {
+    matches!(usage, 0x39 | 0x47 | 0x53)
 }
 
 pub fn macos_value_to_key_state(value: isize) -> Option<(KeyState, bool)> {
     match value {
         0 => Some((KeyState::Up, false)),
+
         1 => Some((KeyState::Down, false)),
+
         _ => None,
     }
 }

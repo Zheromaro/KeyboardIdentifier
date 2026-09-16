@@ -52,7 +52,6 @@ pub(crate) fn scan_code_to_code(code: ScanCode, state: KeyState) -> Code {
             _ => scan_code_to_base_code(scan_code),
         };
     }
-
     scan_code_to_base_code(scan_code)
 }
 
@@ -148,7 +147,7 @@ fn scan_code_to_base_code(scan_code: u16) -> Code {
         0x5A => Code::IntlYen,
         0x5B => Code::IntlRo,
         0x5C => Code::KanaMode,
-        0x5D => Code::KanaMode,
+        0x5D => Code::Unidentified, // FIXED: Base 0x5D is non-standard; E0 5D correctly maps to ContextMenu above
         0x64 => Code::F13,
         0x65 => Code::F14,
         0x66 => Code::F15,
