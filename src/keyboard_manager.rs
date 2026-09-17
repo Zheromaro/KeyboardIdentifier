@@ -96,7 +96,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
             return;
         };
 
-        let on_pressed = self.on_key_action.clone();
+        let on_key_action = self.on_key_action.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();
         let active_keyboards = self.active_keyboards.clone();
@@ -126,7 +126,7 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
                         on_unplugged.for_each(|cb| cb(&kb));
                     }
                     Ok(KeyboardEvent::KeyAction(kb, key_action)) => {
-                        on_pressed.for_each(|cb| cb(&kb, &key_action));
+                        on_key_action.for_each(|cb| cb(&kb, &key_action));
                     }
                     Err(e) => {
                         error!(error = %e, "keyboard source error");

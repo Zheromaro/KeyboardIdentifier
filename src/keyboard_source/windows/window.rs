@@ -73,7 +73,7 @@ pub(crate) struct WindowState {
     sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
     keyboards: Vec<(DeviceHandle, Arc<Keyboard>)>,
     modifiers: Modifiers,
-    pressed_keys: HashSet<(DeviceHandle, u16)>,
+    key_action_keys: HashSet<(DeviceHandle, u16)>,
 }
 
 impl WindowState {
@@ -88,7 +88,7 @@ impl WindowState {
                 .map(|d| (d.handle, Arc::new(d.keyboard)))
                 .collect(),
             modifiers: Modifiers::empty(),
-            pressed_keys: HashSet::new(),
+            key_action_keys: HashSet::new(),
         }
     }
 
@@ -109,7 +109,7 @@ impl WindowState {
             GIDC_REMOVAL => {
                 if let Some(index) = self.keyboards.iter().position(|(c, _)| c == &device) {
                     let keyboard = self.keyboards.remove(index).1;
-                    self.pressed_keys.retain(|(d, _)| d != &device);
+                    self.key_action_keys.retain(|(d, _)| d != &device);
                     let _ = self
                         .sender
                         .blocking_send(Ok(KeyboardEvent::Unplugged(keyboard)));
@@ -156,10 +156,10 @@ impl WindowState {
 
         let key_tuple = (device, raw_vkey);
         let repeat = if is_up {
-            self.pressed_keys.remove(&key_tuple);
+            self.key_action_keys.remove(&key_tuple);
             false
         } else {
-            !self.pressed_keys.insert(key_tuple)
+            !self.key_action_keys.insert(key_tuple)
         };
 
         let modifier = modifier_for_key(vkey, is_e0);
@@ -198,7 +198,7 @@ impl WindowState {
 
         let _ = self
             .sender
-            .blocking_send(Ok(KeyboardEvent::Pressed(keyboard, key_event)));
+            .blocking_send(Ok(KeyboardEvent::KeyAction(keyboard, key_event)));
     }
 }
 

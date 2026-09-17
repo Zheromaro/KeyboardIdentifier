@@ -47,10 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Assigning events
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let tx_pressed = tx.clone();
+    let tx_key_action = tx.clone();
     manager.on_key_action(move |kb: &Keyboard, ke: &KeyEvent| {
         let name = kb.keyboard_id.name.as_deref().unwrap_or("Unknown Keyboard");
-        let _ = tx_pressed.send(format!("Pressed: {name}\nEvent: {:?}", ke));
+        let _ = tx_key_action.send(format!("KeyAction: {name}\nEvent: {:?}", ke));
     });
 
     let tx_plugged = tx.clone();

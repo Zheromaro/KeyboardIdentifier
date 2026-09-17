@@ -62,15 +62,15 @@ impl MockDeviceSource {
     pub fn release(&self, keyboard: &Keyboard) {
         let mut event = key_event(Key::Character("a".into()), Code::KeyA);
         event.state = KeyState::Up;
-        self.send_pressed(keyboard, event);
+        self.send_key_action(keyboard, event);
     }
 
     /// Simulates a key press with an explicit logical key and physical code.
     pub fn press_key(&self, keyboard: &Keyboard, key: Key, code: Code) {
-        self.send_pressed(keyboard, key_event(key, code));
+        self.send_key_action(keyboard, key_event(key, code));
     }
 
-    fn send_pressed(&self, keyboard: &Keyboard, event: KeyEvent) {
+    fn send_key_action(&self, keyboard: &Keyboard, event: KeyEvent) {
         let devices = self.devices.lock().unwrap();
         if let Some(dev) = devices.iter().find(|dev| ***dev == *keyboard) {
             let _ = self.tx.send(KeyboardEvent::KeyAction(dev.clone(), event));

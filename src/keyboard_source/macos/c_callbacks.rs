@@ -102,9 +102,9 @@ pub(super) extern "C" fn input_callback(
 
         if let Err(e) = ctx
             .sender
-            .try_send(Ok(KeyboardEvent::Pressed(kb.clone(), key_event)))
+            .try_send(Ok(KeyboardEvent::KeyAction(kb.clone(), key_event)))
         {
-            warn!(error = %e, "Dropped Pressed event: channel full");
+            warn!(error = %e, "Dropped KeyAction event: channel full");
         }
 
         // Remove modifier after sending the Up event

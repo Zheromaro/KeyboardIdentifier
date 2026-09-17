@@ -14,9 +14,9 @@ async fn test_listen_routes_all_events() {
         let _ = tx_plugged.send("plugged");
     });
 
-    let tx_pressed = tx.clone();
+    let tx_key_action = tx.clone();
     listener.on_key_action(move |_, _| {
-        let _ = tx_pressed.send("pressed");
+        let _ = tx_key_action.send("key action");
     });
 
     let tx_unplugged = tx.clone();
@@ -35,7 +35,7 @@ async fn test_listen_routes_all_events() {
 
     // Verify they are routed and received in the exact order they were triggered
     assert_eq!(expect_recv(&mut rx).await, "plugged");
-    assert_eq!(expect_recv(&mut rx).await, "pressed");
+    assert_eq!(expect_recv(&mut rx).await, "key action");
     assert_eq!(expect_recv(&mut rx).await, "unplugged");
 
     expect_timeout(&mut rx).await;
