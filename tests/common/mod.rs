@@ -107,7 +107,7 @@ impl KeyboardSource for MockDeviceSource {
             .collect()
     }
 
-    async fn receive_event(&mut self) -> Result<KeyboardEvent, std::io::Error> {
+    async fn subscribe(&mut self) -> Result<KeyboardEvent, std::io::Error> {
         self.rx
             .lock()
             .await

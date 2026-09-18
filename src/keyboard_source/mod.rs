@@ -11,6 +11,7 @@ pub use linux::LinuxKeyboardSource as NativeKeyboardSource;
 
 #[cfg(target_os = "windows")]
 mod windows;
+use tokio::sync::broadcast;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsKeyboardSource as NativeKeyboardSource;
 
@@ -68,6 +69,15 @@ impl fmt::Display for KeyboardID {
     }
 }
 
+/// Defines the level of access requested for an input device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Standard shared access alongside other applications.
+    Shared,
+    /// Exclusive access, preventing other applications from receiving device inputs.
+    Exclusive,
+}
+
 /// Represents a connected keyboard device, combining its hardware identity
 /// and physical connection port.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +86,8 @@ pub struct Keyboard {
     pub keyboard_id: KeyboardID,
     /// The physical port information of the keyboard.
     pub port_id: PortID,
+    /// The level of access requested for an input device.
+    pub access: Access,
 }
 
 impl fmt::Display for Keyboard {
@@ -136,7 +148,17 @@ pub trait KeyboardSource: Sized {
     ///
     /// Returns an `io::Error` if the underlying OS event source fails,
     /// encounters a permissions issue, or is disconnected.
-    fn receive_event(
-        &mut self,
-    ) -> impl Future<Output = Result<KeyboardEvent, std::io::Error>> + Send;
+    fn subscribe(&self) -> broadcast::Receiver<KeyboardEvent>;
+
+    /// Consumes (grabs) a specific keyboard device.
+    ///
+    /// Once consumed, the keyboard's input is suppressed and will not reach
+    /// other applications or the operating system.
+    fn consume(&self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Releases a previously consumed keyboard device.
+    ///
+    /// Once released, the keyboard's input will pass through normally to
+    /// other applications and the operating system.
+    fn release(&self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send;
 }
