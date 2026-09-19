@@ -5,18 +5,18 @@ use keyboard_identifier::{KeyboardManager, keyboard_source::KeyboardSource};
 #[tokio::test]
 async fn test_no_keyboards() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardManager::from(computer);
+    let manager = KeyboardManager::from(computer);
 
-    assert!(listener.get_keyboards().is_empty());
+    assert!(manager.get_keyboards().is_empty());
 }
 
 #[tokio::test]
 async fn test_plug_single_keyboard() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardManager::from(computer.clone());
+    let manager = KeyboardManager::from(computer.clone());
 
     let plugged_keyboard = computer.plug_keyboard();
-    let keyboard_list = listener.get_keyboards();
+    let keyboard_list = manager.get_keyboards();
 
     assert_eq!(keyboard_list.len(), 1);
     assert_eq!(keyboard_list[0], plugged_keyboard);
@@ -24,23 +24,23 @@ async fn test_plug_single_keyboard() {
 #[tokio::test]
 async fn test_unplug_keyboard() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardManager::from(computer.clone());
+    let manager = KeyboardManager::from(computer.clone());
     let plugged_keyboard = computer.plug_keyboard();
 
-    assert_eq!(listener.get_keyboards().len(), 1);
+    assert_eq!(manager.get_keyboards().len(), 1);
 
     computer.unplug_keyboard(&plugged_keyboard);
 
-    assert!(listener.get_keyboards().is_empty());
+    assert!(manager.get_keyboards().is_empty());
 }
 
 #[tokio::test]
 async fn test_multiple_keyboards() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardManager::from(computer.clone());
+    let manager = KeyboardManager::from(computer.clone());
     let expected_keyboards: Vec<_> = (0..5).map(|_| computer.plug_keyboard()).collect();
 
-    let keyboard_list = listener.get_keyboards();
+    let keyboard_list = manager.get_keyboards();
 
     assert_eq!(keyboard_list.len(), 5);
     assert_eq!(keyboard_list, expected_keyboards);
@@ -49,7 +49,7 @@ async fn test_multiple_keyboards() {
 #[tokio::test]
 async fn test_unplug_specific_keyboard_among_many() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let listener = KeyboardManager::from(computer.clone());
+    let manager = KeyboardManager::from(computer.clone());
 
     let kb1 = computer.plug_keyboard();
     let kb2 = computer.plug_keyboard();
@@ -57,7 +57,7 @@ async fn test_unplug_specific_keyboard_among_many() {
 
     computer.unplug_keyboard(&kb2);
 
-    let keyboard_list = listener.get_keyboards();
+    let keyboard_list = manager.get_keyboards();
 
     assert_eq!(keyboard_list.len(), 2);
     assert_eq!(keyboard_list, vec![kb1, kb3]);

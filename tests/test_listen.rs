@@ -5,27 +5,27 @@ use keyboard_identifier::{KeyboardManager, keyboard_source::KeyboardSource};
 #[tokio::test]
 async fn test_listen_routes_all_events() {
     let computer = MockDeviceSource::new().await.unwrap();
-    let mut listener = KeyboardManager::from(computer.clone());
+    let manager = KeyboardManager::from(computer.clone());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Register one callback for each event type, sending a distinct string
     let tx_plugged = tx.clone();
-    listener.on_plugged(move |_| {
+    manager.on_plugged(move |_| {
         let _ = tx_plugged.send("plugged");
     });
 
     let tx_key_action = tx.clone();
-    listener.on_key_action(move |_, _| {
+    manager.on_key_action(move |_, _| {
         let _ = tx_key_action.send("key action");
     });
 
     let tx_unplugged = tx.clone();
-    listener.on_unplugged(move |_| {
+    manager.on_unplugged(move |_| {
         let _ = tx_unplugged.send("unplugged");
     });
 
     // Start listening
-    listener.listen().await;
+    manager.listen().await;
     tokio::task::yield_now().await;
 
     // Trigger all three events in sequence
@@ -48,13 +48,13 @@ async fn test_listen_shuts_down_on_drop() {
 
     // Create a local scope for the listener so we can force it to drop
     {
-        let mut listener = KeyboardManager::from(computer.clone());
+        let manager = KeyboardManager::from(computer.clone());
         let tx_plugged = tx.clone();
 
-        listener.on_plugged(move |_| {
+        manager.on_plugged(move |_| {
             let _ = tx_plugged.send("plugged");
         });
-        listener.listen().await;
+        manager.listen().await;
         tokio::task::yield_now().await;
 
         // Trigger an event to prove the listener is currently active

@@ -7,7 +7,10 @@ use super::{
 use evdev::{Device as EvdevDevice, KeyCode};
 use keyboard_types::{KeyboardEvent as KeyEvent, Modifiers};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::sync::{broadcast, mpsc};
+use tokio::{
+    io,
+    sync::{broadcast, mpsc, oneshot},
+};
 use tracing::error;
 
 const ENODEV: i32 = 19;
@@ -53,6 +56,8 @@ async fn evdev_loop(
     };
 
     let mut modifiers = Modifiers::empty();
+    let mut pressed_keys = std::collections::HashSet::new();
+    let mut pending_grab: Option<(Arc<Keyboard>, oneshot::Sender<io::Result<()>>)> = None;
 
     loop {
         tokio::select! {
@@ -61,8 +66,13 @@ async fn evdev_loop(
                 let Some(cmd) = cmd else { break };
                 match cmd {
                     Command::Consume(new_kb, reply) => {
-                        keyboard = new_kb;
-                        let _ = reply.send(stream.device_mut().grab());
+                        if pressed_keys.is_empty() {
+                            keyboard = new_kb;
+                            let _ = reply.send(stream.device_mut().grab());
+                        } else {
+                            // Defer grab until all pressed keys are released
+                            pending_grab = Some((new_kb, reply));
+                        }
                     }
                     Command::Release(new_kb, reply) => {
                         keyboard = new_kb;
@@ -94,6 +104,15 @@ async fn evdev_loop(
                 let Some((state, repeat)) = evdev_to_key_state(event.value()) else {
                     continue;
                 };
+
+                match state {
+                    keyboard_types::KeyState::Down => {
+                        if !repeat { pressed_keys.insert(key_code); }
+                    }
+                    keyboard_types::KeyState::Up => {
+                        pressed_keys.remove(&key_code);
+                    }
+                }
 
                 let modifier = modifier_for_key(key_code);
                 let is_lock_key = matches!(
@@ -130,12 +149,12 @@ async fn evdev_loop(
                     is_composing: false,
                 };
 
-                // No active receivers is not an error — just means nobody is listening.
-                if sender
-                    .send(KeyboardEvent::KeyAction(keyboard.clone(), key_event))
-                    .is_err()
-                {
-                    // All receivers dropped; keep running so we maintain device state.
+                let _ = sender.send(KeyboardEvent::KeyAction(keyboard.clone(), key_event));
+
+                if pressed_keys.is_empty()
+                    && let Some((new_kb, reply)) = pending_grab.take() {
+                        keyboard = new_kb;
+                        let _ = reply.send(stream.device_mut().grab());
                 }
             }
         }

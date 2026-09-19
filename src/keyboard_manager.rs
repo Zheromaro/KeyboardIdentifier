@@ -1,5 +1,4 @@
 use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource, NativeKeyboardSource};
-use crate::registry::Registry;
 use keyboard_types::KeyboardEvent as KeyEvent;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
@@ -11,8 +10,11 @@ type KeyActionCallback = Arc<dyn Fn(&Keyboard, &KeyEvent) + Send + Sync + 'stati
 /// The main manager for tracking keyboards and listening to their events.
 ///
 /// `KeyboardManager` maintains a list of active keyboards and allows you to
-/// register callbacks for specific events: key actions, device plugged,
+/// subscribe to a stream of events including key actions, device plugged,
 /// and device unplugged.
+///
+/// Callback-based methods (`on_key_action`, `on_plugged`, and `on_unplugged`)
+/// are provided for basics usage.
 ///
 /// # Type Parameters
 ///
@@ -20,11 +22,15 @@ type KeyActionCallback = Arc<dyn Fn(&Keyboard, &KeyEvent) + Send + Sync + 'stati
 ///   the OS-native source (`NativeKeyboardSource`).
 pub struct KeyboardManager<P: KeyboardSource = NativeKeyboardSource> {
     provider: P,
+
     active_keyboards: Arc<RwLock<Vec<Keyboard>>>,
     consumed_keyboards: Arc<RwLock<Vec<Keyboard>>>,
-    on_key_action: Registry<KeyActionCallback>,
-    on_plugged: Registry<DeviceCallback>,
-    on_unplugged: Registry<DeviceCallback>,
+
+    on_key_action: Arc<RwLock<Vec<KeyActionCallback>>>,
+    on_plugged: Arc<RwLock<Vec<DeviceCallback>>>,
+    on_unplugged: Arc<RwLock<Vec<DeviceCallback>>>,
+
+    events: broadcast::Sender<KeyboardEvent>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -82,12 +88,21 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
         Ok(())
     }
 
+    /// Subscribes to the stream of keyboard events.
+    ///
+    /// Each subscriber receives its own [`broadcast::Receiver`].
+    pub fn subscribe(&self) -> broadcast::Receiver<KeyboardEvent> {
+        self.events.subscribe()
+    }
+
     /// Registers a callback to be executed when a keyboard is plugged in.
     pub fn on_plugged<F>(&self, callback: F)
     where
         F: Fn(&Keyboard) + Send + Sync + 'static,
     {
-        self.on_plugged.register(Arc::new(callback));
+        if let Ok(mut callbacks) = self.on_plugged.write() {
+            callbacks.push(Arc::new(callback));
+        }
     }
 
     /// Registers a callback to be executed when a keyboard is unplugged.
@@ -95,27 +110,33 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
     where
         F: Fn(&Keyboard) + Send + Sync + 'static,
     {
-        self.on_unplugged.register(Arc::new(callback));
+        if let Ok(mut callbacks) = self.on_unplugged.write() {
+            callbacks.push(Arc::new(callback));
+        }
     }
 
-    /// Registers a callback to be executed when any key action (press or release)
-    /// occurs on any tracked keyboard.
+    /// Registers a callback to be executed when any key action occurs.
     pub fn on_key_action<F>(&self, callback: F)
     where
         F: Fn(&Keyboard, &KeyEvent) + Send + Sync + 'static,
     {
-        self.on_key_action.register(Arc::new(callback));
+        if let Ok(mut callbacks) = self.on_key_action.write() {
+            callbacks.push(Arc::new(callback));
+        }
     }
 
     /// Starts the background event listening loop.
     pub async fn listen(&self) {
         let mut events = self.provider.subscribe();
 
+        let active_keyboards = self.active_keyboards.clone();
+        let consumed_keyboards = self.consumed_keyboards.clone();
+
         let on_key_action = self.on_key_action.clone();
         let on_plugged = self.on_plugged.clone();
         let on_unplugged = self.on_unplugged.clone();
-        let active_keyboards = self.active_keyboards.clone();
-        let consumed_keyboards = self.consumed_keyboards.clone();
+
+        let events_tx = self.events.clone();
         let mut shutdown = self.shutdown.subscribe();
 
         tokio::spawn(async move {
@@ -129,30 +150,57 @@ impl<P: KeyboardSource + Send + 'static> KeyboardManager<P> {
 
                     result = events.recv() => {
                         match result {
-                            Ok(KeyboardEvent::Plugged(kb)) => {
-                                if let Ok(mut kbs) = active_keyboards.write()
-                                    && !kbs.contains(&*kb) {
-                                        kbs.push((*kb).clone());
+                            Ok(event) => {
+                                match &event {
+                                    KeyboardEvent::Plugged(kb) => {
+                                        if let Ok(mut keyboards) = active_keyboards.write()
+                                            && !keyboards.contains(&**kb)
+                                        {
+                                            keyboards.push((**kb).clone());
+                                        }
+
+                                        let callbacks = on_plugged
+                                            .read()
+                                            .map(|callbacks| callbacks.clone())
+                                            .unwrap_or_default();
+
+                                        for callback in callbacks {
+                                            callback(&**kb);
+                                        }
+                                    }
+
+                                    KeyboardEvent::Unplugged(kb) => {
+                                        if let Ok(mut keyboards) = active_keyboards.write() {
+                                            keyboards.retain(|k| k != &**kb);
+                                        }
+
+                                        if let Ok(mut consumed) = consumed_keyboards.write() {
+                                            consumed.retain(|k| k != &**kb);
+                                        }
+
+                                        let callbacks = on_unplugged
+                                            .read()
+                                            .map(|callbacks| callbacks.clone())
+                                            .unwrap_or_default();
+
+                                        for callback in callbacks {
+                                            callback(&**kb);
+                                        }
+                                    }
+
+                                    KeyboardEvent::KeyAction(kb, key_action) => {
+                                        let callbacks = on_key_action
+                                            .read()
+                                            .map(|callbacks| callbacks.clone())
+                                            .unwrap_or_default();
+
+                                        for callback in callbacks {
+                                            callback(&**kb, key_action);
+                                        }
+                                    }
                                 }
 
-                                on_plugged.for_each(|cb| cb(&kb));
-                            }
-
-                            Ok(KeyboardEvent::Unplugged(kb)) => {
-                                if let Ok(mut kbs) = active_keyboards.write() {
-                                    kbs.retain(|k| k != &*kb);
-                                }
-
-                                // Clean up consumed tracker if the device is unplugged
-                                if let Ok(mut consumed) = consumed_keyboards.write() {
-                                    consumed.retain(|k| k != &*kb);
-                                }
-
-                                on_unplugged.for_each(|cb| cb(&kb));
-                            }
-
-                            Ok(KeyboardEvent::KeyAction(kb, key_action)) => {
-                                on_key_action.for_each(|cb| cb(&kb, &key_action));
+                                let _ = events_tx.send(event);
                             }
 
                             Err(broadcast::error::RecvError::Lagged(count)) => {
@@ -175,15 +223,20 @@ impl KeyboardManager {
     pub async fn new() -> std::io::Result<Self> {
         let provider = NativeKeyboardSource::new().await?;
         let initial_keyboards = provider.enumerate_keyboards();
+
+        let (events_tx, _) = broadcast::channel(1024);
         let (shutdown, _) = broadcast::channel(1);
 
         Ok(Self {
             provider,
             active_keyboards: Arc::new(RwLock::new(initial_keyboards)),
             consumed_keyboards: Arc::new(RwLock::new(Vec::new())),
-            on_key_action: Registry::new(),
-            on_plugged: Registry::new(),
-            on_unplugged: Registry::new(),
+
+            on_key_action: Arc::new(RwLock::new(Vec::new())),
+            on_plugged: Arc::new(RwLock::new(Vec::new())),
+            on_unplugged: Arc::new(RwLock::new(Vec::new())),
+
+            events: events_tx,
             shutdown,
         })
     }
@@ -193,15 +246,20 @@ impl<P: KeyboardSource> From<P> for KeyboardManager<P> {
     /// Creates a new `KeyboardManager` from a custom [`KeyboardSource`] provider.
     fn from(provider: P) -> Self {
         let initial_keyboards = provider.enumerate_keyboards();
+
+        let (events_tx, _) = broadcast::channel(1024);
         let (shutdown, _) = broadcast::channel(1);
 
         Self {
             provider,
             active_keyboards: Arc::new(RwLock::new(initial_keyboards)),
             consumed_keyboards: Arc::new(RwLock::new(Vec::new())),
-            on_key_action: Registry::new(),
-            on_plugged: Registry::new(),
-            on_unplugged: Registry::new(),
+
+            on_key_action: Arc::new(RwLock::new(Vec::new())),
+            on_plugged: Arc::new(RwLock::new(Vec::new())),
+            on_unplugged: Arc::new(RwLock::new(Vec::new())),
+
+            events: events_tx,
             shutdown,
         }
     }
