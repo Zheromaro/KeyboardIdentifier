@@ -1,148 +1,83 @@
 mod device;
 mod key_mapping;
-mod window;
+mod win32_props;
+
 use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource};
-use device::DeviceEnumerator;
+use device::{DeviceEnumerator, InterceptionState};
+use interception::{FilterKeyState, Interception, Stroke};
 pub use keyboard_types::KeyboardEvent as KeyEvent;
 use std::{
     io,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     thread::{self, JoinHandle},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::error;
-use window::{MessageOnlyWindow, WindowHandleSlot, WindowState};
 
-pub(crate) fn win32_error(message: &'static str) -> io::Error {
-    let code = unsafe { windows::Win32::Foundation::GetLastError().0 as i32 };
-    if code == 0 {
-        io::Error::other(message)
-    } else {
-        io::Error::from_raw_os_error(code)
-    }
-}
+static INTERCEPTION_OWNER: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn windows_error(error: windows::core::Error) -> io::Error {
-    io::Error::other(error)
-}
+pub(crate) struct InterceptionOwner;
 
-static RAW_INPUT_OWNER: AtomicBool = AtomicBool::new(false);
-
-pub(crate) struct RawInputOwner;
-
-impl RawInputOwner {
+impl InterceptionOwner {
     pub(crate) fn acquire() -> io::Result<Self> {
-        if RAW_INPUT_OWNER
+        if INTERCEPTION_OWNER
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "another WindowsKeyboardSource is already active",
+                "Another interception instance is already active",
             ));
         }
         Ok(Self)
     }
 }
 
-impl Drop for RawInputOwner {
+impl Drop for InterceptionOwner {
     fn drop(&mut self) {
-        RAW_INPUT_OWNER.store(false, Ordering::Release);
-    }
-}
-
-pub(crate) struct InputThread {
-    hwnd: Arc<WindowHandleSlot>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl InputThread {
-    pub(crate) fn spawn(
-        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-        init_sender: oneshot::Sender<io::Result<()>>,
-    ) -> Self {
-        let hwnd = Arc::new(WindowHandleSlot::new());
-        let thread_hwnd = Arc::clone(&hwnd);
-        let thread = thread::spawn(move || {
-            let result = Self::initialize(sender, Arc::clone(&thread_hwnd));
-            match result {
-                Ok(window) => {
-                    let _ = init_sender.send(Ok(()));
-                    window.run_message_loop();
-                }
-                Err(err) => {
-                    let _ = init_sender.send(Err(err));
-                }
-            }
-            thread_hwnd.clear();
-        });
-        Self {
-            hwnd,
-            thread: Some(thread),
-        }
-    }
-
-    fn initialize(
-        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
-        hwnd_slot: Arc<WindowHandleSlot>,
-    ) -> io::Result<MessageOnlyWindow> {
-        let instance = unsafe {
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .map(windows::Win32::Foundation::HINSTANCE::from)
-                .map_err(windows_error)?
-        };
-        let devices = DeviceEnumerator::enumerate_keyboards()?;
-        let window = MessageOnlyWindow::create(instance, WindowState::new(sender, devices))
-            .map_err(windows_error)?;
-        hwnd_slot.store(window.hwnd());
-        if let Err(err) = window.register_raw_input() {
-            window.destroy();
-            hwnd_slot.clear();
-            return Err(err);
-        }
-        Ok(window)
-    }
-}
-
-impl Drop for InputThread {
-    fn drop(&mut self) {
-        self.hwnd.close();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        INTERCEPTION_OWNER.store(false, Ordering::Release);
     }
 }
 
 pub struct WindowsKeyboardSource {
     events: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
-    _owner: RawInputOwner,
-    thread: Option<InputThread>,
+    _owner: InterceptionOwner,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl KeyboardSource for WindowsKeyboardSource {
     async fn new() -> io::Result<Self> {
-        let owner = RawInputOwner::acquire()?;
+        let owner = InterceptionOwner::acquire()?;
         let (event_tx, event_rx) = mpsc::channel(128);
-        let (init_tx, init_rx) = oneshot::channel::<io::Result<()>>();
-        let thread = InputThread::spawn(event_tx, init_tx);
 
-        match init_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                drop(thread);
-                return Err(err);
+        let thread = thread::spawn(move || {
+            let context = match Interception::new() {
+                Some(ctx) => ctx,
+                None => {
+                    let _ = event_tx.blocking_send(Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Failed to initialize Interception context. Is the driver installed?",
+                    )));
+                    return;
+                }
+            };
+
+            // Filter only keyboard events
+            context.set_filter(context.is_keyboard(), FilterKeyState::All.into());
+
+            let mut state = InterceptionState::new(event_tx, &context);
+
+            // Blocking loop: Wait for intercepted hardware events
+            while let Some((device, stroke)) = context.wait() {
+                if context.is_keyboard(device) {
+                    state.handle_input(&context, device, &stroke);
+                }
+
+                // CRITICAL: We must forward the stroke back to the OS.
+                // If we don't, the user's keyboard input is swallowed entirely.
+                context.send(device, &[stroke]);
             }
-            Err(_) => {
-                drop(thread);
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Windows keyboard input thread exited during initialization",
-                ));
-            }
-        }
+        });
 
         Ok(Self {
             events: event_rx,
@@ -152,13 +87,17 @@ impl KeyboardSource for WindowsKeyboardSource {
     }
 
     fn enumerate_keyboards(&self) -> Vec<Keyboard> {
-        match DeviceEnumerator::enumerate_keyboards() {
-            Ok(devices) => devices.into_iter().map(|d| d.keyboard).collect(),
-            Err(err) => {
-                error!(error = %err, "Failed to enumerate Windows keyboards");
-                Vec::new()
+        let context = match Interception::new() {
+            Some(ctx) => ctx,
+            None => {
+                error!("Failed to initialize Interception context for enumeration.");
+                return Vec::new();
             }
-        }
+        };
+        DeviceEnumerator::enumerate_keyboards(&context)
+            .into_iter()
+            .map(|d| d.keyboard)
+            .collect()
     }
 
     async fn receive_event(&mut self) -> io::Result<KeyboardEvent> {
@@ -166,7 +105,7 @@ impl KeyboardSource for WindowsKeyboardSource {
             Some(result) => result,
             None => Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "Windows keyboard input thread exited",
+                "Interception keyboard input thread exited",
             )),
         }
     }
@@ -174,6 +113,8 @@ impl KeyboardSource for WindowsKeyboardSource {
 
 impl Drop for WindowsKeyboardSource {
     fn drop(&mut self) {
+        // Interception blocking loops are difficult to cleanly terminate
+        // without sending a dummy keystroke. We allow the thread to detach.
         self.thread.take();
     }
 }
