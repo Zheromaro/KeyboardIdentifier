@@ -1,12 +1,13 @@
 mod common;
 use common::*;
 use keyboard_identifier::{KeyboardManager, keyboard_source::KeyboardSource};
+use tokio::sync::broadcast;
 
 #[tokio::test]
 async fn test_listen_routes_all_events() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     // Register one callback for each event type, sending a distinct string
     let tx_plugged = tx.clone();
@@ -30,7 +31,7 @@ async fn test_listen_routes_all_events() {
 
     // Trigger all three events in sequence
     let keyboard = computer.plug_keyboard();
-    computer.press(&keyboard);
+    computer.press_a(&keyboard);
     computer.unplug_keyboard(&keyboard);
 
     // Verify they are routed and received in the exact order they were triggered
@@ -43,8 +44,8 @@ async fn test_listen_routes_all_events() {
 
 #[tokio::test]
 async fn test_listen_shuts_down_on_drop() {
-    let computer = MockDeviceSource::new().await.unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let computer = MockKeyboardSource::new().await.unwrap();
+    let (tx, mut rx) = broadcast::channel(10);
 
     // Create a local scope for the listener so we can force it to drop
     {
@@ -83,7 +84,7 @@ async fn test_new() {
 
 #[tokio::test]
 async fn test_from() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     // Verify from() initializes without panicking
     let _listener_new = KeyboardManager::from(computer);
 

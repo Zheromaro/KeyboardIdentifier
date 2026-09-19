@@ -132,7 +132,7 @@ impl fmt::Display for KeyboardEvent {
 ///
 /// Implementors of this trait handle the low-level details of enumerating
 /// keyboards and receiving input events for a specific operating system.
-pub trait KeyboardSource: Sized {
+pub trait KeyboardSource: Send + Sync + Sized {
     /// Creates a new instance of the keyboard source.
     ///
     /// This is an asynchronous operation as it may require initializing

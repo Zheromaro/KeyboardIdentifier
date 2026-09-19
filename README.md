@@ -27,13 +27,29 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "rt-multi-thre
 This example demonstrates how to list available keyboards, ask the user to press a key to "select" a specific keyboard, and then monitor events specifically for that device.
 
 ```rust,no_run
-use keyboard_identifier::{KeyEvent, Keyboard, KeyboardManager};
+use keyboard_identifier::{
+    KeyboardEvent, KeyboardManager,
+    keyboard_types::{
+        Code::{KeyC, KeyR},
+        KeyState,
+    },
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. List available keyboards (informational only)
-    let mut manager = KeyboardManager::new().await.unwrap();
+    #[cfg(target_os = "windows")]
+    println!("Hello from windows");
+
+    #[cfg(target_os = "macos")]
+    println!("Hello from macos");
+
+    #[cfg(target_os = "linux")]
+    println!("Hello from linux");
+
+    // Create the manager and discover the keyboards currently connected.
+    let manager = KeyboardManager::new().await.unwrap();
     let keyboards = manager.get_keyboards();
+
     if keyboards.is_empty() {
         println!("No keyboards found.");
         return Ok(());
@@ -44,37 +60,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}.\n     {},\n     {}", i, kb.keyboard_id, kb.port_id);
     }
 
-    // 2. Assigning events
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    println!("\n=======================================================");
+    println!(" - Press Alt+C on the keyboard you want to consume");
+    println!(" - Press Alt+R on the keyboard you want to release");
+    println!(" - Press Ctrl+C to exit");
+    println!("=======================================================\n");
 
-    let tx_key_action = tx.clone();
-    manager.on_key_action(move |kb: &Keyboard, ke: &KeyEvent| {
-        let name = kb.keyboard_id.name.as_deref().unwrap_or("Unknown Keyboard");
-        let _ = tx_key_action.send(format!("KeyAction: {name}\nEvent: {:?}", ke));
-    });
-
-    let tx_plugged = tx.clone();
-    manager.on_plugged(move |kb: &Keyboard| {
-        let _ = tx_plugged.send(format!(
-            "Plugged: \n     {},\n     {}",
-            kb.keyboard_id, kb.port_id
-        ));
-    });
-
-    let tx_unplugged = tx.clone();
-    manager.on_unplugged(move |kb: &Keyboard| {
-        let _ = tx_unplugged.send(format!(
-            "Unplugged: \n     {},\n     {}",
-            kb.keyboard_id, kb.port_id
-        ));
-    });
-
+    // Start the background listener.
     manager.listen().await;
-    println!("Now listening for events. Press Ctrl+C to quit.");
 
-    // 3. Print each event as it arrives
-    while let Some(event_type) = rx.recv().await {
-        println!("{}", event_type);
+    // Register callbacks for applications that prefer a simple event-driven API.
+    manager.on_plugged(|kb| println!("Plugged: \n     {},\n     {}", kb.keyboard_id, kb.port_id));
+
+    manager
+        .on_unplugged(|kb| println!("Unplugged: \n     {},\n     {}", kb.keyboard_id, kb.port_id));
+
+    manager.on_key_action(|kb, event| {
+        let name = kb.keyboard_id.name.as_deref().unwrap_or("Unknown Keyboard");
+        println!(
+            "Pressed: {} | event: {:?}, {:?}",
+            name, event.state, event.code
+        )
+    });
+
+    // Alternatively subscribe to keyboard events,
+    // handle the event stream directly when more control is needed (consume/release).
+    let mut events = manager.subscribe();
+    while let Ok(event) = events.recv().await {
+        match event {
+            KeyboardEvent::KeyAction(kb, ke) => {
+                let name = kb.keyboard_id.name.as_deref().unwrap_or("Unknown Keyboard");
+
+                // Consume or release the keyboard using a simple Alt+key shortcut.
+                if ke.state == KeyState::Down && !ke.repeat && ke.modifiers.alt() {
+                    if ke.code == KeyC {
+                        if let Err(e) = manager.consume(&kb).await {
+                            eprintln!("Failed to consume keyboard: {}", e);
+                        } else {
+                            println!("Consumed keyboard: {}", name);
+                        }
+                    }
+
+                    if ke.code == KeyR {
+                        if let Err(e) = manager.release(&kb).await {
+                            eprintln!("Failed to release keyboard: {}", e);
+                        } else {
+                            println!("Released keyboard: {}", name);
+                        }
+                    }
+                }
+            }
+            KeyboardEvent::Plugged(_) => {}
+            KeyboardEvent::Unplugged(_) => {}
+        }
     }
 
     Ok(())
@@ -94,7 +132,9 @@ The primary struct representing a connected device. It contains two identifiers:
 A rename to KeyboardEvent struct from keyboard_types crate, found on : https://crates.io/crates/keyboard-types
 
 ```rust,no_run
-pub struct KeyboardEvent {
+use keyboard_types::{Code, Key, KeyState, Location, Modifiers};
+
+pub struct KeyEvent {
     pub state: KeyState,
     pub key: Key,
     pub code: Code,
@@ -103,7 +143,6 @@ pub struct KeyboardEvent {
     /* … */
 }
 ```
-although key field is not set
 
 ## Supported OS
 - **Windows** (`target_os = "windows"`): Uses Raw Input and SetupAPI.

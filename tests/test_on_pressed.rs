@@ -2,12 +2,13 @@ mod common;
 use common::*;
 use keyboard_identifier::{keyboard_source::*, *};
 use keyboard_types::{Code, Key, KeyState};
+use tokio::sync::broadcast;
 
 #[tokio::test]
 async fn test_no_press() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |_, _| {
         let _ = tx.send(());
@@ -20,11 +21,11 @@ async fn test_no_press() {
 
 #[tokio::test]
 async fn test_other_keyboard_press_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let keyboard2 = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |kb, _| {
         if kb.keyboard_id == keyboard.keyboard_id {
@@ -34,23 +35,23 @@ async fn test_other_keyboard_press_one_job() {
 
     manager.listen().await;
     tokio::task::yield_now().await;
-    computer.press(&keyboard2);
+    computer.press_a(&keyboard2);
 
     expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
 async fn test_one_press_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |_, _| {
         let _ = tx.send(());
     });
     manager.listen().await;
-    computer.press(&keyboard);
+    computer.press_a(&keyboard);
 
     expect_recv(&mut rx).await;
     expect_timeout(&mut rx).await;
@@ -58,10 +59,10 @@ async fn test_one_press_one_job() {
 
 #[tokio::test]
 async fn test_two_presses_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |_, _| {
         let _ = tx.send(());
@@ -69,8 +70,8 @@ async fn test_two_presses_one_job() {
     manager.listen().await;
     tokio::task::yield_now().await;
 
-    computer.press(&keyboard);
-    computer.press(&keyboard);
+    computer.press_a(&keyboard);
+    computer.press_a(&keyboard);
 
     expect_recv(&mut rx).await;
     expect_recv(&mut rx).await;
@@ -79,11 +80,11 @@ async fn test_two_presses_one_job() {
 
 #[tokio::test]
 async fn test_one_press_two_jobs() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     let target_id = keyboard.keyboard_id.clone();
     let tx1 = tx.clone();
@@ -100,7 +101,7 @@ async fn test_one_press_two_jobs() {
 
     manager.listen().await;
     tokio::task::yield_now().await;
-    computer.press(&keyboard);
+    computer.press_a(&keyboard);
 
     let mut results = vec![expect_recv(&mut rx).await, expect_recv(&mut rx).await];
     results.sort(); // Sort because concurrent job execution order isn't guaranteed
@@ -111,10 +112,10 @@ async fn test_one_press_two_jobs() {
 
 #[tokio::test]
 async fn test_two_presses_two_jobs() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     let tx1 = tx.clone();
     manager.on_key_action(move |_, _| {
@@ -129,8 +130,8 @@ async fn test_two_presses_two_jobs() {
     manager.listen().await;
     tokio::task::yield_now().await;
 
-    computer.press(&keyboard);
-    computer.press(&keyboard);
+    computer.press_a(&keyboard);
+    computer.press_a(&keyboard);
 
     let mut results = Vec::new();
     for _ in 0..4 {
@@ -144,10 +145,10 @@ async fn test_two_presses_two_jobs() {
 
 #[tokio::test]
 async fn test_release_triggers_callback_with_up_state() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |_, event| {
         let _ = tx.send(event.state);
@@ -155,18 +156,20 @@ async fn test_release_triggers_callback_with_up_state() {
     manager.listen().await;
     tokio::task::yield_now().await;
 
-    computer.release(&keyboard);
+    computer.press_a(&keyboard);
+    computer.release_a(&keyboard);
 
+    assert_eq!(expect_recv(&mut rx).await, KeyState::Down);
     assert_eq!(expect_recv(&mut rx).await, KeyState::Up);
     expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
 async fn test_key_event_data() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |_, event| {
         let _ = tx.send((event.key.clone(), event.code, event.state));
@@ -185,10 +188,10 @@ async fn test_key_event_data() {
 
 #[tokio::test]
 async fn test_press_after_unplug_no_event() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_key_action(move |_, _| {
         let _ = tx.send(());
@@ -197,17 +200,17 @@ async fn test_press_after_unplug_no_event() {
     tokio::task::yield_now().await;
 
     computer.unplug_keyboard(&keyboard);
-    computer.press(&keyboard);
+    computer.press_a(&keyboard);
 
     expect_timeout(&mut rx).await;
 }
 
 #[tokio::test]
 async fn test_plug_and_unplug_callbacks() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (plug_tx, mut plug_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (unplug_tx, mut unplug_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (plug_tx, mut plug_rx) = broadcast::channel(10);
+    let (unplug_tx, mut unplug_rx) = broadcast::channel(10);
 
     manager.on_plugged(move |kb| {
         let _ = plug_tx.send(kb.keyboard_id.name.clone());
@@ -232,7 +235,7 @@ async fn test_plug_and_unplug_callbacks() {
 
 #[tokio::test]
 async fn test_get_keyboards_tracks_plug_unplug() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
     manager.listen().await;

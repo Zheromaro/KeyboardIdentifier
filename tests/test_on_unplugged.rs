@@ -1,13 +1,14 @@
 mod common;
 use common::*;
 use keyboard_identifier::{keyboard_source::*, *};
+use tokio::sync::broadcast;
 
 #[tokio::test]
 async fn test_no_unplug() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let _keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_unplugged(move |_| {
         let _ = tx.send(());
@@ -21,10 +22,10 @@ async fn test_no_unplug() {
 
 #[tokio::test]
 async fn test_one_unplug_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_unplugged(move |_| {
         let _ = tx.send(());
@@ -40,11 +41,11 @@ async fn test_one_unplug_one_job() {
 
 #[tokio::test]
 async fn test_two_unplugs_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let kb1 = computer.plug_keyboard();
     let kb2 = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_unplugged(move |_| {
         let _ = tx.send(());
@@ -62,10 +63,10 @@ async fn test_two_unplugs_one_job() {
 
 #[tokio::test]
 async fn test_one_unplug_two_jobs() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     let tx1 = tx.clone();
     manager.on_unplugged(move |_| {
@@ -91,10 +92,10 @@ async fn test_one_unplug_two_jobs() {
 
 #[tokio::test]
 async fn test_unplugged_id_verification() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let keyboard = computer.plug_keyboard();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_unplugged(move |kb| {
         let _ = tx.send(kb.keyboard_id.clone());

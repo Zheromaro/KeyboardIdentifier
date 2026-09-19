@@ -1,12 +1,13 @@
 mod common;
 use common::*;
 use keyboard_identifier::{keyboard_source::*, *};
+use tokio::sync::broadcast;
 
 #[tokio::test]
 async fn test_no_plugged() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_plugged(move |_| {
         let _ = tx.send(());
@@ -20,9 +21,9 @@ async fn test_no_plugged() {
 
 #[tokio::test]
 async fn test_one_plugged_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_plugged(move |_| {
         let _ = tx.send(());
@@ -40,9 +41,9 @@ async fn test_one_plugged_one_job() {
 
 #[tokio::test]
 async fn test_two_plugged_one_job() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_plugged(move |_| {
         let _ = tx.send(());
@@ -60,9 +61,9 @@ async fn test_two_plugged_one_job() {
 
 #[tokio::test]
 async fn test_one_plugged_two_jobs() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     let tx1 = tx.clone();
     manager.on_plugged(move |_| {
@@ -88,9 +89,9 @@ async fn test_one_plugged_two_jobs() {
 
 #[tokio::test]
 async fn test_plugged_id_verification() {
-    let computer = MockDeviceSource::new().await.unwrap();
+    let computer = MockKeyboardSource::new().await.unwrap();
     let manager = KeyboardManager::from(computer.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = broadcast::channel(10);
 
     manager.on_plugged(move |kb| {
         // We can pass the ID back through the channel to verify it matches
