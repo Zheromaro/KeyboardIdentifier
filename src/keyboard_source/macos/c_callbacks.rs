@@ -20,6 +20,7 @@ pub(super) extern "C" fn matching_callback(
         let kb_arc = Arc::new(keyboard);
         let device_id = device as isize;
         ctx.keyboards.insert(device_id, kb_arc.clone());
+        ctx.devices.insert(device_id, device); // <-- ADD THIS LINE
         ctx.modifiers.insert(device_id, Modifiers::empty());
         if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Plugged(kb_arc))) {
             warn!(error = %e, "Dropped Plugged event: channel full");
@@ -39,6 +40,8 @@ pub(super) extern "C" fn removal_callback(
     let ctx = unsafe { &mut *(context as *mut HidContext) };
     let device_id = device as isize;
     ctx.modifiers.remove(&device_id);
+    ctx.devices.remove(&device_id); // <-- ADD THIS LINE
+
     if let Some(kb) = ctx.keyboards.remove(&device_id) {
         if let Err(e) = ctx.sender.try_send(Ok(KeyboardEvent::Unplugged(kb))) {
             warn!(error = %e, "Dropped Unplugged event: channel full");
@@ -66,20 +69,16 @@ pub(super) extern "C" fn input_callback(
         let usage = IOHIDElementGetUsage(element) as usize;
         let device = IOHIDElementGetDevice(element);
         let device_id = device as isize;
-
         let Some(kb) = ctx.keyboards.get(&device_id) else {
             return;
         };
-
         let code = macos_hid_to_code(usage);
         let key = macos_hid_to_key(usage);
         let location = macos_hid_to_location(usage);
         let modifier = modifier_for_usage(usage);
-
         let Some(modifiers) = ctx.modifiers.get_mut(&device_id) else {
             return;
         };
-
         let event_modifiers = match state {
             keyboard_types::KeyState::Down => {
                 if let Some(modifier) = modifier {
@@ -89,7 +88,6 @@ pub(super) extern "C" fn input_callback(
             }
             keyboard_types::KeyState::Up => *modifiers,
         };
-
         let key_event = KeyEvent {
             state,
             key,
@@ -99,15 +97,12 @@ pub(super) extern "C" fn input_callback(
             repeat,
             is_composing: false,
         };
-
         if let Err(e) = ctx
             .sender
             .try_send(Ok(KeyboardEvent::KeyAction(kb.clone(), key_event)))
         {
             warn!(error = %e, "Dropped KeyAction event: channel full");
         }
-
-        // Remove modifier after sending the Up event
         if state == keyboard_types::KeyState::Up {
             if let Some(modifier) = modifier {
                 modifiers.remove(modifier);
@@ -117,14 +112,13 @@ pub(super) extern "C" fn input_callback(
 }
 
 // --- Helper Functions ---
-
 pub(super) fn create_matching_dictionary() -> CFMutableDictionaryRef {
     unsafe {
         let dict = CFDictionaryCreateMutable(
             ptr::null_mut(),
             0,
-            kCFTypeDictionaryKeyCallBacks,
-            kCFTypeDictionaryValueCallBacks,
+            &super::ffi_declarations::kCFTypeDictionaryKeyCallBacks as *const _ as _,
+            &super::ffi_declarations::kCFTypeDictionaryValueCallBacks as *const _ as _,
         );
         let page_key = CFStringCreateWithCString(
             ptr::null_mut(),
@@ -153,7 +147,6 @@ pub(super) fn get_string_property(device: IOHIDDeviceRef, key: &[u8]) -> Option<
         let cf_key = CFStringCreateWithCString(ptr::null_mut(), key.as_ptr() as _, 0x08000100);
         let cf_val = IOHIDDeviceGetProperty(device, cf_key);
         CFRelease(cf_key);
-
         if cf_val.is_null() || CFGetTypeID(cf_val) != CFStringGetTypeID() {
             return None;
         }
@@ -180,7 +173,6 @@ pub(super) fn get_int_property(device: IOHIDDeviceRef, key: &[u8]) -> Option<i32
         let cf_key = CFStringCreateWithCString(ptr::null_mut(), key.as_ptr() as _, 0x08000100);
         let cf_val = IOHIDDeviceGetProperty(device, cf_key);
         CFRelease(cf_key);
-
         if cf_val.is_null() || CFGetTypeID(cf_val) != CFNumberGetTypeID() {
             return None;
         }
