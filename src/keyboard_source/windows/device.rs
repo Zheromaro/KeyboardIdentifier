@@ -1,5 +1,5 @@
 use super::win32_error;
-use crate::keyboard_source::{Keyboard, KeyboardID, PortID};
+use crate::keyboard_source::{Access, Keyboard, KeyboardID, PortID};
 use std::{ffi::c_void, io, mem::size_of};
 use windows::Win32::{
     Devices::{
@@ -104,6 +104,7 @@ impl DeviceEnumerator {
             port_id: PortID {
                 physical_path: Self::physical_path(&path),
             },
+            access: Access::Shared,
         };
 
         let (product, serial) = Self::hid_strings(&path);

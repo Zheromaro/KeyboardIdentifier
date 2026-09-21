@@ -3,7 +3,7 @@ use super::{
     device::{DeviceEnumerator, DeviceHandle, DiscoveredKeyboard, RawInput},
     key_mapping::*,
 };
-use crate::keyboard_source::{Keyboard, KeyboardEvent};
+use crate::keyboard_source::{Access, Keyboard, KeyboardEvent};
 use keyboard_types::{KeyState, Modifiers};
 use std::{
     collections::HashSet,
@@ -11,11 +11,11 @@ use std::{
     io,
     ptr::null_mut,
     sync::{
-        Arc,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicIsize, Ordering},
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use windows::Win32::{
     Foundation::{
         ERROR_CLASS_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
@@ -27,21 +27,33 @@ use windows::Win32::{
             RegisterRawInputDevices,
         },
         WindowsAndMessaging::{
-            CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GWLP_USERDATA, GetMessageW,
-            GetWindowLongPtrW, HWND_MESSAGE, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-            SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_INPUT,
-            WM_INPUT_DEVICE_CHANGE, WM_NCCREATE, WM_NCDESTROY, WNDCLASSEXW,
+            CREATESTRUCTW, CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DefWindowProcW,
+            DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GWLP_USERDATA,
+            GetMessageW, GetWindowLongPtrW, HHOOK, HWND_MESSAGE, MSG, PostMessageW,
+            PostQuitMessage, RegisterClassExW, SetWindowLongPtrW, SetWindowsHookExW,
+            TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+            WM_CLOSE, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_NCCREATE, WM_NCDESTROY, WM_USER,
+            WNDCLASSEXW,
         },
     },
 };
 use windows::core::w;
 
 const WINDOW_CLASS_NAME: windows::core::PCWSTR = w!("KeyboardIdentifierRawInputWindow");
+pub(crate) const WM_USER_COMMAND: u32 = WM_USER + 100;
+
+static CONSUMED_HANDLES: LazyLock<RwLock<HashSet<DeviceHandle>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+static LAST_RAW_HANDLE: RwLock<Option<DeviceHandle>> = RwLock::new(None);
+
+pub(crate) enum ThreadCommand {
+    Consume(Keyboard, oneshot::Sender<io::Result<()>>),
+    Release(Keyboard, oneshot::Sender<io::Result<()>>),
+}
 
 #[derive(Debug)]
 pub(crate) struct WindowHandleSlot {
-    value: AtomicIsize,
+    pub(crate) value: AtomicIsize,
 }
 
 impl WindowHandleSlot {
@@ -67,19 +79,39 @@ impl WindowHandleSlot {
             }
         }
     }
+
+    pub(crate) fn notify(&self) {
+        let value = self.value.load(Ordering::Acquire);
+        if value != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(value as *mut c_void),
+                    WM_USER_COMMAND,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 }
 
 pub(crate) struct WindowState {
-    sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+    sender: broadcast::Sender<KeyboardEvent>,
     keyboards: Vec<(DeviceHandle, Arc<Keyboard>)>,
+    consumed_devices: HashSet<DeviceHandle>,
     modifiers: Modifiers,
     key_action_keys: HashSet<(DeviceHandle, u16)>,
+    cmd_rx: mpsc::Receiver<ThreadCommand>,
+    instance: HINSTANCE,
+    hook_handle: Option<HHOOK>,
 }
 
 impl WindowState {
     pub(crate) fn new(
-        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+        sender: broadcast::Sender<KeyboardEvent>,
         keyboards: Vec<DiscoveredKeyboard>,
+        cmd_rx: mpsc::Receiver<ThreadCommand>,
+        instance: HINSTANCE,
     ) -> Self {
         Self {
             sender,
@@ -87,9 +119,136 @@ impl WindowState {
                 .into_iter()
                 .map(|d| (d.handle, Arc::new(d.keyboard)))
                 .collect(),
+            consumed_devices: HashSet::new(),
             modifiers: Modifiers::empty(),
             key_action_keys: HashSet::new(),
+            cmd_rx,
+            instance,
+            hook_handle: None,
         }
+    }
+
+    fn find_device_handle(&self, target: &Keyboard) -> Option<DeviceHandle> {
+        self.keyboards.iter().find_map(|(handle, kb)| {
+            if kb.keyboard_id == target.keyboard_id && kb.port_id == target.port_id {
+                Some(*handle)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn process_commands(&mut self) {
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            match cmd {
+                ThreadCommand::Consume(target_kb, reply) => {
+                    let result = self.handle_consume(&target_kb);
+                    let _ = reply.send(result);
+                }
+                ThreadCommand::Release(target_kb, reply) => {
+                    let result = self.handle_release(&target_kb);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    fn handle_consume(&mut self, target_kb: &Keyboard) -> io::Result<()> {
+        let Some(device) = self.find_device_handle(target_kb) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Specified keyboard was not found",
+            ));
+        };
+
+        if self.consumed_devices.insert(device) {
+            if let Ok(mut global_set) = CONSUMED_HANDLES.write() {
+                global_set.insert(device);
+            }
+
+            if let Some(pos) = self.keyboards.iter().position(|(d, _)| *d == device) {
+                let mut updated_kb = (*self.keyboards[pos].1).clone();
+                updated_kb.access = Access::Exclusive;
+                self.keyboards[pos].1 = Arc::new(updated_kb);
+            }
+
+            if self.hook_handle.is_none() {
+                let hook = unsafe {
+                    SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(Self::ll_keyboard_proc),
+                        self.instance,
+                        0,
+                    )
+                }
+                .map_err(io::Error::other)?;
+                self.hook_handle = Some(hook);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_release(&mut self, target_kb: &Keyboard) -> io::Result<()> {
+        let Some(device) = self.find_device_handle(target_kb) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Specified keyboard was not found",
+            ));
+        };
+
+        if self.consumed_devices.remove(&device) {
+            if let Ok(mut global_set) = CONSUMED_HANDLES.write() {
+                global_set.remove(&device);
+            }
+
+            if let Some(pos) = self.keyboards.iter().position(|(d, _)| *d == device) {
+                let mut updated_kb = (*self.keyboards[pos].1).clone();
+                updated_kb.access = Access::Shared;
+                self.keyboards[pos].1 = Arc::new(updated_kb);
+            }
+
+            if self.consumed_devices.is_empty() {
+                if let Some(hook) = self.hook_handle.take() {
+                    unsafe {
+                        let _ = UnhookWindowsHookEx(hook);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    unsafe extern "system" fn ll_keyboard_proc(
+        ncode: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if ncode >= 0 {
+            let is_consumed = if let Ok(last) = LAST_RAW_HANDLE.read() {
+                if let Some(dev) = *last {
+                    if let Ok(consumed) = CONSUMED_HANDLES.read() {
+                        consumed.contains(&dev)
+                    } else {
+                        false
+                    }
+                } else {
+                    if let Ok(consumed) = CONSUMED_HANDLES.read() {
+                        !consumed.is_empty()
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if is_consumed {
+                return LRESULT(1);
+            }
+        }
+        unsafe { CallNextHookEx(None, ncode, wparam, lparam) }
     }
 
     fn handle_device_change(&mut self, action: u32, handle: HANDLE) {
@@ -100,9 +259,7 @@ impl WindowState {
                     if let Some(keyboard) = DeviceEnumerator::keyboard_from_handle(handle) {
                         let keyboard = Arc::new(keyboard);
                         self.keyboards.push((device, Arc::clone(&keyboard)));
-                        let _ = self
-                            .sender
-                            .blocking_send(Ok(KeyboardEvent::Plugged(keyboard)));
+                        let _ = self.sender.send(KeyboardEvent::Plugged(keyboard));
                     }
                 }
             }
@@ -110,9 +267,11 @@ impl WindowState {
                 if let Some(index) = self.keyboards.iter().position(|(c, _)| c == &device) {
                     let keyboard = self.keyboards.remove(index).1;
                     self.key_action_keys.retain(|(d, _)| d != &device);
-                    let _ = self
-                        .sender
-                        .blocking_send(Ok(KeyboardEvent::Unplugged(keyboard)));
+                    self.consumed_devices.remove(&device);
+                    if let Ok(mut global_set) = CONSUMED_HANDLES.write() {
+                        global_set.remove(&device);
+                    }
+                    let _ = self.sender.send(KeyboardEvent::Unplugged(keyboard));
                 }
             }
             _ => {}
@@ -128,6 +287,10 @@ impl WindowState {
         }
         let handle = input.device();
         let device = DeviceHandle::from(handle);
+
+        if let Ok(mut last) = LAST_RAW_HANDLE.write() {
+            *last = Some(device);
+        }
 
         let keyboard = match self
             .keyboards
@@ -198,7 +361,7 @@ impl WindowState {
 
         let _ = self
             .sender
-            .blocking_send(Ok(KeyboardEvent::KeyAction(keyboard, key_event)));
+            .send(KeyboardEvent::KeyAction(keyboard, key_event));
     }
 }
 
@@ -307,6 +470,14 @@ impl MessageOnlyWindow {
                 }
                 LRESULT(0)
             }
+            WM_USER_COMMAND => {
+                if let Some(state) =
+                    unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState).as_mut() }
+                {
+                    state.process_commands();
+                }
+                LRESULT(0)
+            }
             WM_INPUT_DEVICE_CHANGE => {
                 if let Some(state) =
                     unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState).as_mut() }
@@ -338,7 +509,13 @@ impl MessageOnlyWindow {
                     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     if !ptr.is_null() {
-                        drop(Box::from_raw(ptr));
+                        let mut state = Box::from_raw(ptr);
+                        if let Some(hook) = state.hook_handle.take() {
+                            let _ = UnhookWindowsHookEx(hook);
+                        }
+                        if let Ok(mut set) = CONSUMED_HANDLES.write() {
+                            set.clear();
+                        }
                     }
                     PostQuitMessage(0);
                 }

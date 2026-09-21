@@ -153,7 +153,7 @@ pub trait KeyboardSource: Send + Sync + Sized {
     /// Consumes (grabs) a specific keyboard device.
     ///
     /// Once consumed, the keyboard's input is suppressed and will not reach
-    /// other applications or the operating system.
+    /// other applications.
     fn consume(&self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Releases a previously consumed keyboard device.

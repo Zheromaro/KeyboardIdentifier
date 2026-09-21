@@ -12,9 +12,9 @@ use std::{
     },
     thread::{self, JoinHandle},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::error;
-use window::{MessageOnlyWindow, WindowHandleSlot, WindowState};
+use window::{MessageOnlyWindow, ThreadCommand, WindowHandleSlot, WindowState};
 
 pub(crate) fn win32_error(message: &'static str) -> io::Error {
     let code = unsafe { windows::Win32::Foundation::GetLastError().0 as i32 };
@@ -56,18 +56,21 @@ impl Drop for RawInputOwner {
 
 pub(crate) struct InputThread {
     hwnd: Arc<WindowHandleSlot>,
+    cmd_tx: mpsc::Sender<ThreadCommand>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl InputThread {
     pub(crate) fn spawn(
-        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+        sender: broadcast::Sender<KeyboardEvent>,
         init_sender: oneshot::Sender<io::Result<()>>,
     ) -> Self {
         let hwnd = Arc::new(WindowHandleSlot::new());
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let thread_hwnd = Arc::clone(&hwnd);
+
         let thread = thread::spawn(move || {
-            let result = Self::initialize(sender, Arc::clone(&thread_hwnd));
+            let result = Self::initialize(sender, cmd_rx, Arc::clone(&thread_hwnd));
             match result {
                 Ok(window) => {
                     let _ = init_sender.send(Ok(()));
@@ -79,14 +82,17 @@ impl InputThread {
             }
             thread_hwnd.clear();
         });
+
         Self {
             hwnd,
+            cmd_tx,
             thread: Some(thread),
         }
     }
 
     fn initialize(
-        sender: mpsc::Sender<Result<KeyboardEvent, io::Error>>,
+        sender: broadcast::Sender<KeyboardEvent>,
+        cmd_rx: mpsc::Receiver<ThreadCommand>,
         hwnd_slot: Arc<WindowHandleSlot>,
     ) -> io::Result<MessageOnlyWindow> {
         let instance = unsafe {
@@ -95,8 +101,12 @@ impl InputThread {
                 .map_err(windows_error)?
         };
         let devices = DeviceEnumerator::enumerate_keyboards()?;
-        let window = MessageOnlyWindow::create(instance, WindowState::new(sender, devices))
-            .map_err(windows_error)?;
+        let window = MessageOnlyWindow::create(
+            instance,
+            WindowState::new(sender, devices, cmd_rx, instance),
+        )
+        .map_err(windows_error)?;
+
         hwnd_slot.store(window.hwnd());
         if let Err(err) = window.register_raw_input() {
             window.destroy();
@@ -104,6 +114,24 @@ impl InputThread {
             return Err(err);
         }
         Ok(window)
+    }
+
+    pub(crate) async fn send_command(
+        &self,
+        make_cmd: impl FnOnce(oneshot::Sender<io::Result<()>>) -> ThreadCommand,
+    ) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let cmd = make_cmd(tx);
+
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Input thread exited"))?;
+
+        self.hwnd.notify();
+
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Input thread exited"))?
     }
 }
 
@@ -117,7 +145,7 @@ impl Drop for InputThread {
 }
 
 pub struct WindowsKeyboardSource {
-    events: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
+    event_tx: broadcast::Sender<KeyboardEvent>,
     _owner: RawInputOwner,
     thread: Option<InputThread>,
 }
@@ -125,9 +153,9 @@ pub struct WindowsKeyboardSource {
 impl KeyboardSource for WindowsKeyboardSource {
     async fn new() -> io::Result<Self> {
         let owner = RawInputOwner::acquire()?;
-        let (event_tx, event_rx) = mpsc::channel(128);
+        let (event_tx, _) = broadcast::channel(128);
         let (init_tx, init_rx) = oneshot::channel::<io::Result<()>>();
-        let thread = InputThread::spawn(event_tx, init_tx);
+        let thread = InputThread::spawn(event_tx.clone(), init_tx);
 
         match init_rx.await {
             Ok(Ok(())) => {}
@@ -145,7 +173,7 @@ impl KeyboardSource for WindowsKeyboardSource {
         }
 
         Ok(Self {
-            events: event_rx,
+            event_tx,
             _owner: owner,
             thread: Some(thread),
         })
@@ -161,13 +189,35 @@ impl KeyboardSource for WindowsKeyboardSource {
         }
     }
 
-    async fn receive_event(&mut self) -> io::Result<KeyboardEvent> {
-        match self.events.recv().await {
-            Some(result) => result,
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Windows keyboard input thread exited",
-            )),
+    fn subscribe(&self) -> broadcast::Receiver<KeyboardEvent> {
+        self.event_tx.subscribe()
+    }
+
+    async fn consume(&self, keyboard: &Keyboard) -> io::Result<()> {
+        if let Some(thread) = &self.thread {
+            let kb = keyboard.clone();
+            thread
+                .send_command(|tx| ThreadCommand::Consume(kb, tx))
+                .await
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Input thread not running",
+            ))
+        }
+    }
+
+    async fn release(&self, keyboard: &Keyboard) -> io::Result<()> {
+        if let Some(thread) = &self.thread {
+            let kb = keyboard.clone();
+            thread
+                .send_command(|tx| ThreadCommand::Release(kb, tx))
+                .await
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Input thread not running",
+            ))
         }
     }
 }
