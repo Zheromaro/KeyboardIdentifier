@@ -1,9 +1,10 @@
-use super::{key_mapping::*, win32_props};
-use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardID, PortID};
-use interception::{Device, Interception, Stroke};
-use keyboard_types::{KeyState, Modifiers};
+use crate::keyboard_source::{Access, Keyboard, KeyboardEvent, KeyboardID, PortID};
+use interception::{Device, Interception, ScanCode, Stroke, is_keyboard};
+use keyboard_types::{KeyState as KeyEventState, Modifiers};
 use std::{collections::HashSet, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
+
+use super::{key_mapping::*, win32_props};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveredKeyboard {
@@ -16,17 +17,27 @@ pub(crate) struct DeviceEnumerator;
 impl DeviceEnumerator {
     pub(crate) fn enumerate_keyboards(context: &Interception) -> Vec<DiscoveredKeyboard> {
         let mut keyboards = Vec::new();
-        for i in 1..=interception::MAX_KEYBOARD {
-            let device = Device::new(i);
-            if let Some(keyboard) = Self::keyboard_from_device(context, device) {
-                keyboards.push(DiscoveredKeyboard { device, keyboard });
+        // INTERCEPTION_MAX_KEYBOARD is defined as 10 in the C library
+        for i in 1..=10 {
+            let device = i as Device;
+            if is_keyboard(device) {
+                if let Some(keyboard) = Self::keyboard_from_device(context, device) {
+                    keyboards.push(DiscoveredKeyboard { device, keyboard });
+                }
             }
         }
         keyboards
     }
 
     pub(crate) fn keyboard_from_device(context: &Interception, device: Device) -> Option<Keyboard> {
-        let raw_id = context.get_hardware_id(device)?;
+        let mut buffer = [0u8; 512];
+        // get_hardware_id requires a mutable buffer and returns the length written
+        let len = context.get_hardware_id(device, &mut buffer);
+        if len == 0 {
+            return None;
+        }
+
+        let raw_id = String::from_utf8_lossy(&buffer[..len as usize]).to_string();
         if raw_id.is_empty() {
             return None;
         }
@@ -36,7 +47,7 @@ impl DeviceEnumerator {
         let hardware_id = path.split('#').nth(1).unwrap_or_default();
         let (product, serial) = win32_props::hid_strings(&path);
 
-        let mut keyboard = Keyboard {
+        Some(Keyboard {
             keyboard_id: KeyboardID {
                 name: product,
                 vendor_id: Self::extract_hex(hardware_id, "VID_"),
@@ -46,15 +57,13 @@ impl DeviceEnumerator {
             port_id: PortID {
                 physical_path: win32_props::physical_path(&path),
             },
-        };
-
-        Some(keyboard)
+            access: Access::Shared,
+        })
     }
 
     fn extract_hex(val: &str, prefix: &str) -> Option<String> {
         let upper_val = val.to_ascii_uppercase();
         let start = upper_val.find(prefix)?;
-
         let val = &val[start + prefix.len()..];
         let end = val
             .find(|c: char| !c.is_ascii_hexdigit())
@@ -71,17 +80,15 @@ impl DeviceEnumerator {
 }
 
 pub(crate) struct InterceptionState {
-    sender: mpsc::Sender<Result<KeyboardEvent, std::io::Error>>,
+    sender: broadcast::Sender<KeyboardEvent>,
     keyboards: Vec<(Device, Arc<Keyboard>)>,
     modifiers: Modifiers,
-    key_action_keys: HashSet<(Device, u16)>,
+    // Use ScanCode directly to avoid u16 casting mismatches
+    key_action_keys: HashSet<(Device, ScanCode)>,
 }
 
 impl InterceptionState {
-    pub(crate) fn new(
-        sender: mpsc::Sender<Result<KeyboardEvent, std::io::Error>>,
-        context: &Interception,
-    ) -> Self {
+    pub(crate) fn new(sender: broadcast::Sender<KeyboardEvent>, context: &Interception) -> Self {
         Self {
             sender,
             keyboards: DeviceEnumerator::enumerate_keyboards(context)
@@ -104,9 +111,7 @@ impl InterceptionState {
                 if let Some(k) = DeviceEnumerator::keyboard_from_device(context, device) {
                     let k = Arc::new(k);
                     self.keyboards.push((device, Arc::clone(&k)));
-                    let _ = self
-                        .sender
-                        .blocking_send(Ok(KeyboardEvent::Plugged(Arc::clone(&k))));
+                    let _ = self.sender.send(KeyboardEvent::Plugged(Arc::clone(&k)));
                     k
                 } else {
                     return;
@@ -114,9 +119,14 @@ impl InterceptionState {
             }
         };
 
-        let is_e0 = (state & 2) != 0;
-        let is_up = (state & 1) != 0;
-        let key_state = if is_up { KeyState::Up } else { KeyState::Down };
+        // Use .bits() to safely check bitflags against integers
+        let is_e0 = state.bits() & 2 != 0;
+        let is_up = state.bits() & 1 != 0;
+        let key_state = if is_up {
+            KeyEventState::Up
+        } else {
+            KeyEventState::Down
+        };
 
         let key_tuple = (device, *code);
         let repeat = if is_up {
@@ -126,11 +136,13 @@ impl InterceptionState {
             !self.key_action_keys.insert(key_tuple)
         };
 
-        let modifier = modifier_for_scancode(*code, is_e0);
-        let is_lock_key = is_lock_scancode(*code);
+        // Cast ScanCode to u16 to match your key_mapping function signatures
+        let code_u16 = *code as u16;
+        let modifier = modifier_for_scancode(code_u16, is_e0);
+        let is_lock_key = is_lock_scancode(code_u16);
 
         let event_modifiers = match key_state {
-            KeyState::Down => {
+            KeyEventState::Down => {
                 if let Some(modifier) = modifier {
                     if is_lock_key && !repeat {
                         self.modifiers.toggle(modifier);
@@ -140,7 +152,7 @@ impl InterceptionState {
                 }
                 self.modifiers
             }
-            KeyState::Up => {
+            KeyEventState::Up => {
                 if !is_lock_key {
                     if let Some(modifier) = modifier {
                         self.modifiers.remove(modifier);
@@ -150,11 +162,11 @@ impl InterceptionState {
             }
         };
 
-        let key_event = super::KeyEvent {
+        let key_event = keyboard_types::KeyboardEvent {
             state: key_state,
-            key: scancode_to_key(*code, is_e0),
-            code: scancode_to_code(*code, is_e0),
-            location: scancode_to_location(*code, is_e0),
+            key: scancode_to_key(code_u16, is_e0),
+            code: scancode_to_code(code_u16, is_e0),
+            location: scancode_to_location(code_u16, is_e0),
             modifiers: event_modifiers,
             repeat,
             is_composing: false,
@@ -162,6 +174,6 @@ impl InterceptionState {
 
         let _ = self
             .sender
-            .blocking_send(Ok(KeyboardEvent::KeyAction(keyboard, key_event)));
+            .send(KeyboardEvent::KeyAction(keyboard, key_event));
     }
 }

@@ -4,15 +4,29 @@ mod win32_props;
 
 use crate::keyboard_source::{Keyboard, KeyboardEvent, KeyboardSource};
 use device::{DeviceEnumerator, InterceptionState};
-use interception::{FilterKeyState, Interception, Stroke};
-pub use keyboard_types::KeyboardEvent as KeyEvent;
+use interception::{Filter, Interception, KeyFilter, KeyState, ScanCode, Stroke};
 use std::{
+    collections::HashSet,
+    env, fs,
+    future::Future,
     io,
-    sync::atomic::{AtomicBool, Ordering},
+    process::Command,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
 };
-use tokio::sync::mpsc;
-use tracing::error;
+use tokio::sync::broadcast;
+
+const INTERCEPTION_DLL: &[u8] = include_bytes!("../../../vendor/interception.dll");
+const INSTALLER_EXE: &[u8] = include_bytes!("../../../vendor/install-interception.exe");
+
+/// Wrapper to make Interception Send + Sync.
+/// The underlying Interception C library uses internal locking, making this safe.
+struct SendableInterception(Interception);
+unsafe impl Send for SendableInterception {}
+unsafe impl Sync for SendableInterception {}
 
 static INTERCEPTION_OWNER: AtomicBool = AtomicBool::new(false);
 
@@ -40,81 +54,151 @@ impl Drop for InterceptionOwner {
 }
 
 pub struct WindowsKeyboardSource {
-    events: mpsc::Receiver<Result<KeyboardEvent, io::Error>>,
-    _owner: InterceptionOwner,
+    sender: broadcast::Sender<KeyboardEvent>,
+    context: Arc<SendableInterception>,
+    consumed_devices: Arc<RwLock<HashSet<interception::Device>>>,
+    should_stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl KeyboardSource for WindowsKeyboardSource {
     async fn new() -> io::Result<Self> {
-        let owner = InterceptionOwner::acquire()?;
-        let (event_tx, event_rx) = mpsc::channel(128);
+        let _owner = InterceptionOwner::acquire()?;
+
+        let context = Interception::new().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to initialize Interception context. Is the driver installed?",
+            )
+        })?;
+
+        let context = Arc::new(SendableInterception(context));
+        let (sender, _) = broadcast::channel(1024);
+        let consumed_devices = Arc::new(RwLock::new(HashSet::new()));
+        let should_stop = Arc::new(AtomicBool::new(false));
+
+        let thread_context = Arc::clone(&context);
+        let thread_sender = sender.clone();
+        let thread_consumed = Arc::clone(&consumed_devices);
+        let thread_should_stop = Arc::clone(&should_stop);
 
         let thread = thread::spawn(move || {
-            let context = match Interception::new() {
-                Some(ctx) => ctx,
-                None => {
-                    let _ = event_tx.blocking_send(Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "Failed to initialize Interception context. Is the driver installed?",
-                    )));
-                    return;
-                }
+            // Correct filter syntax for the interception crate
+            thread_context.0.set_filter(
+                interception::is_keyboard,
+                Filter::KeyFilter(KeyFilter::all()),
+            );
+            let mut state = InterceptionState::new(thread_sender, &thread_context.0);
+
+            // Dummy stroke to initialize the receive buffer array
+            let dummy_stroke = Stroke::Keyboard {
+                code: ScanCode::Esc,
+                state: KeyState::empty(),
+                information: 0,
             };
+            let mut strokes = [dummy_stroke];
 
-            // Filter only keyboard events
-            context.set_filter(context.is_keyboard(), FilterKeyState::All.into());
+            while !thread_should_stop.load(Ordering::Relaxed) {
+                let device = thread_context.0.wait();
 
-            let mut state = InterceptionState::new(event_tx, &context);
+                if interception::is_keyboard(device) {
+                    // receive populates the mutable slice and returns the count of strokes read
+                    let count = thread_context.0.receive(device, &mut strokes);
 
-            // Blocking loop: Wait for intercepted hardware events
-            while let Some((device, stroke)) = context.wait() {
-                if context.is_keyboard(device) {
-                    state.handle_input(&context, device, &stroke);
+                    if count > 0 {
+                        let stroke = strokes[0];
+
+                        // 1. Parse and broadcast the event to our application
+                        state.handle_input(&thread_context.0, device, &stroke);
+
+                        // 2. Check if the device is grabbed for exclusive access
+                        let is_consumed = thread_consumed.read().unwrap().contains(&device);
+
+                        // 3. If not consumed, inject the keystroke back into the OS
+                        if !is_consumed {
+                            thread_context.0.send(device, &strokes[..count as usize]);
+                        }
+                    }
                 }
-
-                // CRITICAL: We must forward the stroke back to the OS.
-                // If we don't, the user's keyboard input is swallowed entirely.
-                context.send(device, &[stroke]);
             }
         });
 
         Ok(Self {
-            events: event_rx,
-            _owner: owner,
+            sender,
+            context,
+            consumed_devices,
+            should_stop,
             thread: Some(thread),
         })
     }
 
     fn enumerate_keyboards(&self) -> Vec<Keyboard> {
-        let context = match Interception::new() {
-            Some(ctx) => ctx,
-            None => {
-                error!("Failed to initialize Interception context for enumeration.");
-                return Vec::new();
-            }
-        };
-        DeviceEnumerator::enumerate_keyboards(&context)
+        DeviceEnumerator::enumerate_keyboards(&self.context.0)
             .into_iter()
-            .map(|d| d.keyboard)
+            .map(|dk| dk.keyboard)
             .collect()
     }
 
-    async fn receive_event(&mut self) -> io::Result<KeyboardEvent> {
-        match self.events.recv().await {
-            Some(result) => result,
-            None => Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Interception keyboard input thread exited",
-            )),
+    fn subscribe(&self) -> broadcast::Receiver<KeyboardEvent> {
+        self.sender.subscribe()
+    }
+
+    fn consume(&self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send {
+        let context = Arc::clone(&self.context);
+        let consumed_devices = Arc::clone(&self.consumed_devices);
+        let target_keyboard = keyboard.clone();
+
+        async move {
+            let device_opt = DeviceEnumerator::enumerate_keyboards(&context.0)
+                .into_iter()
+                .find(|dk| {
+                    dk.keyboard.keyboard_id == target_keyboard.keyboard_id
+                        && dk.keyboard.port_id == target_keyboard.port_id
+                })
+                .map(|dk| dk.device);
+
+            if let Some(device) = device_opt {
+                consumed_devices.write().unwrap().insert(device);
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Target keyboard not found or disconnected",
+                ))
+            }
+        }
+    }
+
+    fn release(&self, keyboard: &Keyboard) -> impl Future<Output = io::Result<()>> + Send {
+        let context = Arc::clone(&self.context);
+        let consumed_devices = Arc::clone(&self.consumed_devices);
+        let target_keyboard = keyboard.clone();
+
+        async move {
+            let device_opt = DeviceEnumerator::enumerate_keyboards(&context.0)
+                .into_iter()
+                .find(|dk| {
+                    dk.keyboard.keyboard_id == target_keyboard.keyboard_id
+                        && dk.keyboard.port_id == target_keyboard.port_id
+                })
+                .map(|dk| dk.device);
+
+            if let Some(device) = device_opt {
+                consumed_devices.write().unwrap().remove(&device);
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Target keyboard not found or disconnected",
+                ))
+            }
         }
     }
 }
 
 impl Drop for WindowsKeyboardSource {
     fn drop(&mut self) {
-        // Interception blocking loops are difficult to cleanly terminate
-        // without sending a dummy keystroke. We allow the thread to detach.
+        self.should_stop.store(true, Ordering::Relaxed);
         self.thread.take();
     }
 }

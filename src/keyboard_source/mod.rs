@@ -11,7 +11,6 @@ pub use linux::LinuxKeyboardSource as NativeKeyboardSource;
 
 #[cfg(target_os = "windows")]
 mod windows;
-use tokio::sync::broadcast;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsKeyboardSource as NativeKeyboardSource;
 
@@ -22,6 +21,7 @@ pub use macos::MacosKeyboardSource as NativeKeyboardSource;
 
 pub use keyboard_types::KeyboardEvent as KeyEvent;
 use std::{fmt, future::Future, io, sync::Arc};
+use tokio::sync::broadcast;
 
 /// Represents the physical port or connection path of a keyboard.
 ///
